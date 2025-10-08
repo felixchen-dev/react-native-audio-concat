@@ -1,5 +1,10 @@
 import AudioConcat from './NativeAudioConcat';
 
-export function multiply(a: number, b: number): number {
-  return AudioConcat.multiply(a, b);
+export type { AudioDataOrSilence } from './NativeAudioConcat';
+
+export function concatAudioFiles(
+  data: Array<{ filePath: string } | { durationMs: number }>,
+  outputPath: string
+): Promise<string> {
+  return AudioConcat.concatAudioFiles(data, outputPath);
 }

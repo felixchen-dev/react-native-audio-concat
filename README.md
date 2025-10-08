@@ -6,7 +6,6 @@ Concatenate audio files and silence periods into a single audio file for React N
 
 - ✅ Concat multiple audio files with silence periods
 - ✅ Support for iOS and Android
-- ✅ High performance using [Nitro Modules](https://nitro.margelo.com/)
 - ✅ Output in M4A format
 
 ## Installation
