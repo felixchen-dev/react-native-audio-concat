@@ -57,6 +57,38 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
     val channelCount: Int
   )
 
+  // Buffer pool for silence generation to reduce memory allocations
+  private object SilenceBufferPool {
+    private val pool = ConcurrentHashMap<Int, ByteArray>()
+    private val standardSizes = listOf(4096, 8192, 16384, 32768, 65536, 131072)
+
+    init {
+      // Pre-allocate common silence buffer sizes
+      standardSizes.forEach { size ->
+        pool[size] = ByteArray(size)
+      }
+      Log.d("AudioConcat", "SilenceBufferPool initialized with ${standardSizes.size} standard sizes")
+    }
+
+    fun getBuffer(requestedSize: Int): ByteArray {
+      // Find the smallest standard size that fits the request
+      val standardSize = standardSizes.firstOrNull { it >= requestedSize }
+
+      return if (standardSize != null) {
+        // Return pooled buffer (already zeroed)
+        pool.getOrPut(standardSize) { ByteArray(standardSize) }
+      } else {
+        // Size too large for pool, create new buffer
+        ByteArray(requestedSize)
+      }
+    }
+
+    fun clear() {
+      pool.clear()
+      Log.d("AudioConcat", "SilenceBufferPool cleared")
+    }
+  }
+
   private class PCMCache(
     private val shouldCacheFile: Set<String>,
     private val shouldCacheSilence: Set<SilenceCacheKey>
@@ -166,6 +198,7 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
     private var totalPresentationTimeUs = 0L
     private val sampleRate: Int
     private val channelCount: Int
+    private val maxChunkSize: Int
 
     init {
       this.sampleRate = sampleRate
@@ -178,7 +211,20 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
       )
       outputFormat.setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
       outputFormat.setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
-      outputFormat.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 65536) // Increased from 16384
+
+      // Optimized buffer size based on audio parameters
+      // Target: ~1024 samples per frame for optimal AAC encoding
+      val samplesPerFrame = 1024
+      val bytesPerSample = channelCount * 2 // 16-bit PCM
+      val optimalBufferSize = samplesPerFrame * bytesPerSample
+      // Use at least the optimal size, but allow for some overhead
+      val bufferSize = (optimalBufferSize * 1.5).toInt().coerceAtLeast(16384)
+      outputFormat.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, bufferSize)
+
+      // Store for use in encodePCMChunk
+      this.maxChunkSize = bufferSize
+
+      Log.d("AudioConcat", "Encoder buffer size: $bufferSize bytes (${samplesPerFrame} samples, ${sampleRate}Hz, ${channelCount}ch)")
 
       encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
       encoder.configure(outputFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
@@ -188,8 +234,7 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
     }
 
     fun encodePCMChunk(pcmData: ByteArray, isLast: Boolean = false): Boolean {
-      // Split large PCM data into smaller chunks that fit in encoder buffer
-      val maxChunkSize = 65536 // Match KEY_MAX_INPUT_SIZE
+      // Split large PCM data into smaller chunks that fit in encoder buffer (use configured size)
       var offset = 0
 
       while (offset < pcmData.size) {
@@ -528,13 +573,13 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
                 pcmData = resamplePCM16(pcmData, sourceSampleRate, targetSampleRate, targetChannelCount)
               }
 
-              // Store for caching
-              decodedChunks.add(pcmData.clone())
+              // Optimization: avoid unnecessary clone() - store original for caching
+              decodedChunks.add(pcmData)
               totalBytes += pcmData.size
 
-              // Put to queue with sequence number
+              // Put a clone to queue (queue might modify it)
               val seqNum = sequenceStart.getAndIncrement()
-              queue.put(PCMChunk(pcmData, seqNum))
+              queue.put(PCMChunk(pcmData.clone(), seqNum))
             }
 
             decoder.releaseOutputBuffer(outputBufferIndex, false)
@@ -691,18 +736,32 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
 
     // For short silence (< 5 seconds), cache as single chunk
     if (durationMs < 5000) {
-      val silenceData = ByteArray(totalBytes) // All zeros = silence
+      // Use buffer pool to avoid allocation
+      val pooledBuffer = SilenceBufferPool.getBuffer(totalBytes)
+      val silenceData = if (pooledBuffer.size == totalBytes) {
+        pooledBuffer
+      } else {
+        // Copy only the needed portion
+        pooledBuffer.copyOf(totalBytes)
+      }
       cache.putSilence(cacheKey, silenceData)
       encoder.encodePCMChunk(silenceData, false)
     } else {
-      // For longer silence, process in chunks without caching
+      // For longer silence, process in chunks without caching using pooled buffers
       val chunkSamples = 16384
       var samplesRemaining = totalSamples
 
       while (samplesRemaining > 0) {
         val currentChunkSamples = minOf(chunkSamples, samplesRemaining)
         val chunkBytes = currentChunkSamples * bytesPerSample
-        val silenceChunk = ByteArray(chunkBytes)
+
+        // Use pooled buffer for chunk
+        val pooledBuffer = SilenceBufferPool.getBuffer(chunkBytes)
+        val silenceChunk = if (pooledBuffer.size == chunkBytes) {
+          pooledBuffer
+        } else {
+          pooledBuffer.copyOf(chunkBytes)
+        }
 
         encoder.encodePCMChunk(silenceChunk, false)
         samplesRemaining -= currentChunkSamples
