@@ -175,10 +175,128 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
     }
   }
 
+  private fun resamplePCM16(
+    input: ByteArray,
+    inputSampleRate: Int,
+    outputSampleRate: Int,
+    channelCount: Int
+  ): ByteArray {
+    if (inputSampleRate == outputSampleRate) {
+      return input
+    }
+
+    val inputSampleCount = input.size / (2 * channelCount) // 16-bit = 2 bytes per sample
+    val outputSampleCount = (inputSampleCount.toLong() * outputSampleRate / inputSampleRate).toInt()
+    val output = ByteArray(outputSampleCount * 2 * channelCount)
+
+    val ratio = inputSampleRate.toDouble() / outputSampleRate.toDouble()
+
+    for (i in 0 until outputSampleCount) {
+      val srcPos = i * ratio
+      val srcIndex = srcPos.toInt()
+      val fraction = srcPos - srcIndex
+
+      for (ch in 0 until channelCount) {
+        // Get current and next sample
+        val idx1 = (srcIndex * channelCount + ch) * 2
+        val idx2 = ((srcIndex + 1) * channelCount + ch) * 2
+
+        val sample1 = if (idx1 + 1 < input.size) {
+          (input[idx1].toInt() and 0xFF) or (input[idx1 + 1].toInt() shl 8)
+        } else {
+          0
+        }
+
+        val sample2 = if (idx2 + 1 < input.size) {
+          (input[idx2].toInt() and 0xFF) or (input[idx2 + 1].toInt() shl 8)
+        } else {
+          sample1
+        }
+
+        // Convert to signed 16-bit
+        val s1 = if (sample1 > 32767) sample1 - 65536 else sample1
+        val s2 = if (sample2 > 32767) sample2 - 65536 else sample2
+
+        // Linear interpolation
+        val interpolated = (s1 + (s2 - s1) * fraction).toInt()
+
+        // Clamp to 16-bit range
+        val clamped = interpolated.coerceIn(-32768, 32767)
+
+        // Convert back to unsigned and write
+        val outIdx = (i * channelCount + ch) * 2
+        output[outIdx] = (clamped and 0xFF).toByte()
+        output[outIdx + 1] = (clamped shr 8).toByte()
+      }
+    }
+
+    return output
+  }
+
+  private fun convertChannelCount(
+    input: ByteArray,
+    inputChannels: Int,
+    outputChannels: Int
+  ): ByteArray {
+    if (inputChannels == outputChannels) {
+      return input
+    }
+
+    val sampleCount = input.size / (2 * inputChannels)
+    val output = ByteArray(sampleCount * 2 * outputChannels)
+
+    when {
+      inputChannels == 1 && outputChannels == 2 -> {
+        // Mono to Stereo: duplicate the channel
+        for (i in 0 until sampleCount) {
+          val srcIdx = i * 2
+          val dstIdx = i * 4
+          output[dstIdx] = input[srcIdx]
+          output[dstIdx + 1] = input[srcIdx + 1]
+          output[dstIdx + 2] = input[srcIdx]
+          output[dstIdx + 3] = input[srcIdx + 1]
+        }
+      }
+      inputChannels == 2 && outputChannels == 1 -> {
+        // Stereo to Mono: average the channels
+        for (i in 0 until sampleCount) {
+          val srcIdx = i * 4
+          val dstIdx = i * 2
+
+          val left = (input[srcIdx].toInt() and 0xFF) or (input[srcIdx + 1].toInt() shl 8)
+          val right = (input[srcIdx + 2].toInt() and 0xFF) or (input[srcIdx + 3].toInt() shl 8)
+
+          val leftSigned = if (left > 32767) left - 65536 else left
+          val rightSigned = if (right > 32767) right - 65536 else right
+
+          val avg = ((leftSigned + rightSigned) / 2).coerceIn(-32768, 32767)
+
+          output[dstIdx] = (avg and 0xFF).toByte()
+          output[dstIdx + 1] = (avg shr 8).toByte()
+        }
+      }
+      else -> {
+        // Fallback: just take the first channel
+        for (i in 0 until sampleCount) {
+          val srcIdx = i * 2 * inputChannels
+          val dstIdx = i * 2 * outputChannels
+          for (ch in 0 until minOf(inputChannels, outputChannels)) {
+            output[dstIdx + ch * 2] = input[srcIdx + ch * 2]
+            output[dstIdx + ch * 2 + 1] = input[srcIdx + ch * 2 + 1]
+          }
+        }
+      }
+    }
+
+    return output
+  }
+
   private fun streamDecodeAudioFile(
     filePath: String,
     encoder: StreamingEncoder,
-    isLastFile: Boolean
+    isLastFile: Boolean,
+    targetSampleRate: Int,
+    targetChannelCount: Int
   ) {
     val extractor = MediaExtractor()
     var decoder: MediaCodec? = null
@@ -203,6 +321,16 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
         throw Exception("No audio track found in $filePath")
       }
 
+      val sourceSampleRate = audioFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+      val sourceChannelCount = audioFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+
+      val needsResampling = sourceSampleRate != targetSampleRate
+      val needsChannelConversion = sourceChannelCount != targetChannelCount
+
+      if (needsResampling || needsChannelConversion) {
+        Log.d("AudioConcat", "File: $filePath - ${sourceSampleRate}Hz ${sourceChannelCount}ch -> ${targetSampleRate}Hz ${targetChannelCount}ch")
+      }
+
       extractor.selectTrack(audioTrackIndex)
 
       val mime = audioFormat.getString(MediaFormat.KEY_MIME)!!
@@ -212,7 +340,6 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
 
       val bufferInfo = MediaCodec.BufferInfo()
       var isEOS = false
-      val pcmChunkSize = 8192 // Process in 8KB chunks
 
       while (!isEOS) {
         // Feed input to decoder
@@ -236,10 +363,20 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
           val outputBuffer = decoder.getOutputBuffer(outputBufferIndex)!!
 
           if (bufferInfo.size > 0) {
-            val pcmData = ByteArray(bufferInfo.size)
+            var pcmData = ByteArray(bufferInfo.size)
             outputBuffer.get(pcmData)
 
-            // Stream to encoder immediately
+            // Convert channel count if needed
+            if (needsChannelConversion) {
+              pcmData = convertChannelCount(pcmData, sourceChannelCount, targetChannelCount)
+            }
+
+            // Resample if needed
+            if (needsResampling) {
+              pcmData = resamplePCM16(pcmData, sourceSampleRate, targetSampleRate, targetChannelCount)
+            }
+
+            // Stream to encoder
             encoder.encodePCMChunk(pcmData, false)
           }
 
@@ -352,7 +489,13 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
               Log.d("AudioConcat", "Item $index: Streaming decode $filePath")
 
               val isLastFile = (index == parsedData.size - 1)
-              streamDecodeAudioFile(filePath, encoder, isLastFile)
+              streamDecodeAudioFile(
+                filePath,
+                encoder,
+                isLastFile,
+                audioConfig.sampleRate,
+                audioConfig.channelCount
+              )
             }
 
             is AudioDataOrSilence.Silence -> {
