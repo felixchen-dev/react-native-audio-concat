@@ -13,6 +13,12 @@ import android.media.MediaMuxer
 import java.io.File
 import java.nio.ByteBuffer
 import android.util.Log
+import java.util.concurrent.Executors
+import java.util.concurrent.BlockingQueue
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.ConcurrentHashMap
 
 @ReactModule(name = AudioConcatModule.NAME)
 class AudioConcatModule(reactContext: ReactApplicationContext) :
@@ -27,6 +33,84 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
   private sealed class AudioDataOrSilence {
     data class AudioFile(val filePath: String) : AudioDataOrSilence()
     data class Silence(val durationMs: Double) : AudioDataOrSilence()
+  }
+
+  private data class PCMChunk(
+    val data: ByteArray,
+    val sequenceNumber: Int,
+    val isEndOfStream: Boolean = false
+  ) {
+    companion object {
+      fun endOfStream(sequenceNumber: Int) = PCMChunk(ByteArray(0), sequenceNumber, true)
+    }
+  }
+
+  // Cache for decoded PCM data
+  private data class CachedPCMData(
+    val chunks: List<ByteArray>,
+    val totalBytes: Long
+  )
+
+  private data class SilenceCacheKey(
+    val durationMs: Double,
+    val sampleRate: Int,
+    val channelCount: Int
+  )
+
+  private class PCMCache(
+    private val shouldCacheFile: Set<String>,
+    private val shouldCacheSilence: Set<SilenceCacheKey>
+  ) {
+    private val audioFileCache = ConcurrentHashMap<String, CachedPCMData>()
+    private val silenceCache = ConcurrentHashMap<SilenceCacheKey, ByteArray>()
+    private val maxCacheSizeMB = 100 // Limit cache to 100MB
+    private var currentCacheSizeBytes = 0L
+
+    fun getAudioFile(filePath: String): CachedPCMData? {
+      return audioFileCache[filePath]
+    }
+
+    fun putAudioFile(filePath: String, data: CachedPCMData) {
+      // Only cache if this file appears multiple times
+      if (!shouldCacheFile.contains(filePath)) {
+        return
+      }
+
+      // Check cache size limit
+      if (currentCacheSizeBytes + data.totalBytes > maxCacheSizeMB * 1024 * 1024) {
+        Log.d("AudioConcat", "Cache full, not caching: $filePath")
+        return
+      }
+
+      audioFileCache[filePath] = data
+      currentCacheSizeBytes += data.totalBytes
+      Log.d("AudioConcat", "Cached audio file: $filePath (${data.totalBytes / 1024}KB)")
+    }
+
+    fun getSilence(key: SilenceCacheKey): ByteArray? {
+      return silenceCache[key]
+    }
+
+    fun putSilence(key: SilenceCacheKey, data: ByteArray) {
+      // Only cache if this silence pattern appears multiple times
+      if (!shouldCacheSilence.contains(key)) {
+        return
+      }
+
+      silenceCache[key] = data
+      Log.d("AudioConcat", "Cached silence: ${key.durationMs}ms")
+    }
+
+    fun clear() {
+      audioFileCache.clear()
+      silenceCache.clear()
+      currentCacheSizeBytes = 0
+      Log.d("AudioConcat", "Cache cleared")
+    }
+
+    fun getStats(): String {
+      return "Audio files: ${audioFileCache.size}, Silence patterns: ${silenceCache.size}, Size: ${currentCacheSizeBytes / 1024}KB"
+    }
   }
 
   private fun extractAudioConfig(filePath: String): AudioConfig {
@@ -79,7 +163,7 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
       )
       outputFormat.setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
       outputFormat.setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
-      outputFormat.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 16384)
+      outputFormat.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 65536) // Increased from 16384
 
       encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
       encoder.configure(outputFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
@@ -89,22 +173,48 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
     }
 
     fun encodePCMChunk(pcmData: ByteArray, isLast: Boolean = false): Boolean {
-      // Feed PCM data to encoder
-      val inputBufferIndex = encoder.dequeueInputBuffer(10000)
-      if (inputBufferIndex >= 0) {
-        val inputBuffer = encoder.getInputBuffer(inputBufferIndex)!!
-        inputBuffer.clear()
-        inputBuffer.put(pcmData)
+      // Split large PCM data into smaller chunks that fit in encoder buffer
+      val maxChunkSize = 65536 // Match KEY_MAX_INPUT_SIZE
+      var offset = 0
 
-        val presentationTimeUs = totalPresentationTimeUs
-        totalPresentationTimeUs += (pcmData.size.toLong() * 1_000_000) / (sampleRate * channelCount * 2)
+      while (offset < pcmData.size) {
+        val chunkSize = minOf(maxChunkSize, pcmData.size - offset)
+        val isLastChunk = (offset + chunkSize >= pcmData.size) && isLast
 
-        val flags = if (isLast) MediaCodec.BUFFER_FLAG_END_OF_STREAM else 0
-        encoder.queueInputBuffer(inputBufferIndex, 0, pcmData.size, presentationTimeUs, flags)
+        // Feed PCM data chunk to encoder
+        val inputBufferIndex = encoder.dequeueInputBuffer(10000)
+        if (inputBufferIndex >= 0) {
+          val inputBuffer = encoder.getInputBuffer(inputBufferIndex)!!
+          val bufferCapacity = inputBuffer.capacity()
+
+          // Ensure chunk fits in buffer
+          val actualChunkSize = minOf(chunkSize, bufferCapacity)
+
+          inputBuffer.clear()
+          inputBuffer.put(pcmData, offset, actualChunkSize)
+
+          val presentationTimeUs = totalPresentationTimeUs
+          totalPresentationTimeUs += (actualChunkSize.toLong() * 1_000_000) / (sampleRate * channelCount * 2)
+
+          val flags = if (isLastChunk) MediaCodec.BUFFER_FLAG_END_OF_STREAM else 0
+          encoder.queueInputBuffer(inputBufferIndex, 0, actualChunkSize, presentationTimeUs, flags)
+
+          offset += actualChunkSize
+        } else {
+          // Buffer not available, drain first
+          drainEncoder(false)
+        }
+
+        // Drain encoder output periodically
+        if (offset < pcmData.size || !isLastChunk) {
+          drainEncoder(false)
+        }
       }
 
-      // Drain encoder output
-      drainEncoder(isLast)
+      // Final drain if last chunk
+      if (isLast) {
+        drainEncoder(true)
+      }
 
       return true
     }
@@ -291,6 +401,144 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
     return output
   }
 
+  private fun parallelDecodeToQueue(
+    filePath: String,
+    queue: BlockingQueue<PCMChunk>,
+    sequenceStart: AtomicInteger,
+    targetSampleRate: Int,
+    targetChannelCount: Int,
+    latch: CountDownLatch,
+    cache: PCMCache
+  ) {
+    try {
+      // Check cache first
+      val cachedData = cache.getAudioFile(filePath)
+      if (cachedData != null) {
+        Log.d("AudioConcat", "Using cached PCM for: $filePath")
+        // Put cached chunks to queue
+        for (chunk in cachedData.chunks) {
+          val seqNum = sequenceStart.getAndIncrement()
+          queue.put(PCMChunk(chunk, seqNum))
+        }
+        latch.countDown()
+        return
+      }
+
+      val extractor = MediaExtractor()
+      var decoder: MediaCodec? = null
+      val decodedChunks = mutableListOf<ByteArray>()
+      var totalBytes = 0L
+
+      try {
+        extractor.setDataSource(filePath)
+
+        var audioTrackIndex = -1
+        var audioFormat: MediaFormat? = null
+
+        for (i in 0 until extractor.trackCount) {
+          val format = extractor.getTrackFormat(i)
+          val mime = format.getString(MediaFormat.KEY_MIME) ?: continue
+          if (mime.startsWith("audio/")) {
+            audioTrackIndex = i
+            audioFormat = format
+            break
+          }
+        }
+
+        if (audioTrackIndex == -1 || audioFormat == null) {
+          throw Exception("No audio track found in $filePath")
+        }
+
+        val sourceSampleRate = audioFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+        val sourceChannelCount = audioFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+
+        val needsResampling = sourceSampleRate != targetSampleRate
+        val needsChannelConversion = sourceChannelCount != targetChannelCount
+
+        if (needsResampling || needsChannelConversion) {
+          Log.d("AudioConcat", "Parallel decode: $filePath - ${sourceSampleRate}Hz ${sourceChannelCount}ch -> ${targetSampleRate}Hz ${targetChannelCount}ch")
+        }
+
+        extractor.selectTrack(audioTrackIndex)
+
+        val mime = audioFormat.getString(MediaFormat.KEY_MIME)!!
+        decoder = MediaCodec.createDecoderByType(mime)
+        decoder.configure(audioFormat, null, null, 0)
+        decoder.start()
+
+        val bufferInfo = MediaCodec.BufferInfo()
+        var isEOS = false
+
+        while (!isEOS) {
+          // Feed input to decoder
+          val inputBufferIndex = decoder.dequeueInputBuffer(10000)
+          if (inputBufferIndex >= 0) {
+            val inputBuffer = decoder.getInputBuffer(inputBufferIndex)!!
+            val sampleSize = extractor.readSampleData(inputBuffer, 0)
+
+            if (sampleSize < 0) {
+              decoder.queueInputBuffer(inputBufferIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+            } else {
+              val presentationTimeUs = extractor.sampleTime
+              decoder.queueInputBuffer(inputBufferIndex, 0, sampleSize, presentationTimeUs, 0)
+              extractor.advance()
+            }
+          }
+
+          // Get PCM output from decoder and put to queue
+          val outputBufferIndex = decoder.dequeueOutputBuffer(bufferInfo, 10000)
+          if (outputBufferIndex >= 0) {
+            val outputBuffer = decoder.getOutputBuffer(outputBufferIndex)!!
+
+            if (bufferInfo.size > 0) {
+              var pcmData = ByteArray(bufferInfo.size)
+              outputBuffer.get(pcmData)
+
+              // Convert channel count if needed
+              if (needsChannelConversion) {
+                pcmData = convertChannelCount(pcmData, sourceChannelCount, targetChannelCount)
+              }
+
+              // Resample if needed
+              if (needsResampling) {
+                pcmData = resamplePCM16(pcmData, sourceSampleRate, targetSampleRate, targetChannelCount)
+              }
+
+              // Store for caching
+              decodedChunks.add(pcmData.clone())
+              totalBytes += pcmData.size
+
+              // Put to queue with sequence number
+              val seqNum = sequenceStart.getAndIncrement()
+              queue.put(PCMChunk(pcmData, seqNum))
+            }
+
+            decoder.releaseOutputBuffer(outputBufferIndex, false)
+
+            if ((bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
+              isEOS = true
+            }
+          }
+        }
+
+        // Cache the decoded data
+        if (decodedChunks.isNotEmpty()) {
+          cache.putAudioFile(filePath, CachedPCMData(decodedChunks, totalBytes))
+        }
+
+      } finally {
+        decoder?.stop()
+        decoder?.release()
+        extractor.release()
+      }
+    } catch (e: Exception) {
+      Log.e("AudioConcat", "Error in parallel decode: ${e.message}", e)
+      throw e
+    } finally {
+      latch.countDown()
+    }
+  }
+
   private fun streamDecodeAudioFile(
     filePath: String,
     encoder: StreamingEncoder,
@@ -399,22 +647,259 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
     durationMs: Double,
     encoder: StreamingEncoder,
     sampleRate: Int,
-    channelCount: Int
+    channelCount: Int,
+    cache: PCMCache
   ) {
-    val totalSamples = ((durationMs / 1000.0) * sampleRate).toInt()
-    val chunkSamples = 4096 // Process in chunks
-    val bytesPerSample = channelCount * 2 // 16-bit stereo
+    val cacheKey = SilenceCacheKey(durationMs, sampleRate, channelCount)
 
-    var samplesRemaining = totalSamples
-
-    while (samplesRemaining > 0) {
-      val currentChunkSamples = minOf(chunkSamples, samplesRemaining)
-      val chunkBytes = currentChunkSamples * bytesPerSample
-      val silenceChunk = ByteArray(chunkBytes) // All zeros = silence
-
-      encoder.encodePCMChunk(silenceChunk, false)
-      samplesRemaining -= currentChunkSamples
+    // Check cache first
+    val cachedSilence = cache.getSilence(cacheKey)
+    if (cachedSilence != null) {
+      Log.d("AudioConcat", "Using cached silence: ${durationMs}ms")
+      encoder.encodePCMChunk(cachedSilence, false)
+      return
     }
+
+    // Generate silence
+    val totalSamples = ((durationMs / 1000.0) * sampleRate).toInt()
+    val bytesPerSample = channelCount * 2 // 16-bit stereo
+    val totalBytes = totalSamples * bytesPerSample
+
+    // For short silence (< 5 seconds), cache as single chunk
+    if (durationMs < 5000) {
+      val silenceData = ByteArray(totalBytes) // All zeros = silence
+      cache.putSilence(cacheKey, silenceData)
+      encoder.encodePCMChunk(silenceData, false)
+    } else {
+      // For longer silence, process in chunks without caching
+      val chunkSamples = 16384
+      var samplesRemaining = totalSamples
+
+      while (samplesRemaining > 0) {
+        val currentChunkSamples = minOf(chunkSamples, samplesRemaining)
+        val chunkBytes = currentChunkSamples * bytesPerSample
+        val silenceChunk = ByteArray(chunkBytes)
+
+        encoder.encodePCMChunk(silenceChunk, false)
+        samplesRemaining -= currentChunkSamples
+      }
+    }
+  }
+
+  private fun parallelProcessAudioFiles(
+    audioFiles: List<Pair<Int, String>>, // (index, filePath)
+    encoder: StreamingEncoder,
+    targetSampleRate: Int,
+    targetChannelCount: Int,
+    cache: PCMCache,
+    numThreads: Int = 3
+  ) {
+    if (audioFiles.isEmpty()) return
+
+    // Group consecutive duplicate files
+    val optimizedFiles = mutableListOf<Pair<Int, String>>()
+    val consecutiveDuplicates = mutableMapOf<Int, Int>() // originalIndex -> count
+
+    var i = 0
+    while (i < audioFiles.size) {
+      val (index, filePath) = audioFiles[i]
+      var count = 1
+
+      // Check for consecutive duplicates
+      while (i + count < audioFiles.size && audioFiles[i + count].second == filePath) {
+        count++
+      }
+
+      if (count > 1) {
+        Log.d("AudioConcat", "Detected $count consecutive occurrences of: $filePath")
+        optimizedFiles.add(Pair(index, filePath))
+        consecutiveDuplicates[optimizedFiles.size - 1] = count
+      } else {
+        optimizedFiles.add(Pair(index, filePath))
+      }
+
+      i += count
+    }
+
+    val pcmQueue = LinkedBlockingQueue<PCMChunk>(100)
+    val executor = Executors.newFixedThreadPool(numThreads)
+    val latch = CountDownLatch(optimizedFiles.size)
+    val sequenceCounter = AtomicInteger(0)
+
+    try {
+      // Submit decode tasks for unique files only
+      optimizedFiles.forEachIndexed { optIndex, (index, filePath) ->
+        executor.submit {
+          try {
+            val fileSequenceStart = AtomicInteger(sequenceCounter.get())
+            sequenceCounter.addAndGet(1000000)
+
+            Log.d("AudioConcat", "Starting parallel decode [$index]: $filePath")
+            parallelDecodeToQueue(filePath, pcmQueue, fileSequenceStart, targetSampleRate, targetChannelCount, latch, cache)
+
+            // Mark end with duplicate count
+            val repeatCount = consecutiveDuplicates[optIndex] ?: 1
+            val endSeqNum = fileSequenceStart.get()
+            pcmQueue.put(PCMChunk(ByteArray(0), endSeqNum, true)) // endOfStream marker with repeat count
+
+          } catch (e: Exception) {
+            Log.e("AudioConcat", "Error decoding file $filePath: ${e.message}", e)
+            latch.countDown()
+          }
+        }
+      }
+
+      // Consumer thread: encode in order
+      var filesCompleted = 0
+      var cachedChunks = mutableListOf<ByteArray>()
+      var isCollectingChunks = false
+
+      while (filesCompleted < optimizedFiles.size) {
+        val chunk = pcmQueue.take()
+
+        if (chunk.isEndOfStream) {
+          val optIndex = filesCompleted
+          val repeatCount = consecutiveDuplicates[optIndex] ?: 1
+
+          if (repeatCount > 1 && cachedChunks.isNotEmpty()) {
+            // Repeat the cached chunks
+            Log.d("AudioConcat", "Repeating cached chunks ${repeatCount - 1} more times")
+            repeat(repeatCount - 1) {
+              cachedChunks.forEach { data ->
+                encoder.encodePCMChunk(data, false)
+              }
+            }
+            cachedChunks.clear()
+          }
+
+          filesCompleted++
+          isCollectingChunks = false
+          Log.d("AudioConcat", "Completed file $filesCompleted/${optimizedFiles.size}")
+          continue
+        }
+
+        // Encode chunk
+        encoder.encodePCMChunk(chunk.data, false)
+
+        // Cache chunks for consecutive duplicates
+        val optIndex = filesCompleted
+        if (consecutiveDuplicates.containsKey(optIndex)) {
+          cachedChunks.add(chunk.data.clone())
+        }
+      }
+
+      // Wait for all decode tasks to complete
+      latch.await()
+      Log.d("AudioConcat", "All parallel decode tasks completed")
+
+    } finally {
+      executor.shutdown()
+    }
+  }
+
+  private data class InterleavedPattern(
+    val filePath: String,
+    val silenceKey: SilenceCacheKey?,
+    val indices: List<Int>, // Indices where this pattern occurs
+    val repeatCount: Int
+  )
+
+  private data class DuplicateAnalysis(
+    val duplicateFiles: Set<String>,
+    val duplicateSilence: Set<SilenceCacheKey>,
+    val fileOccurrences: Map<String, List<Int>>, // filePath -> list of indices
+    val silenceOccurrences: Map<SilenceCacheKey, List<Int>>,
+    val interleavedPatterns: List<InterleavedPattern>
+  )
+
+  private fun analyzeDuplicates(
+    parsedData: List<AudioDataOrSilence>,
+    audioConfig: AudioConfig
+  ): DuplicateAnalysis {
+    val fileCounts = mutableMapOf<String, MutableList<Int>>()
+    val silenceCounts = mutableMapOf<SilenceCacheKey, MutableList<Int>>()
+
+    parsedData.forEachIndexed { index, item ->
+      when (item) {
+        is AudioDataOrSilence.AudioFile -> {
+          fileCounts.getOrPut(item.filePath) { mutableListOf() }.add(index)
+        }
+        is AudioDataOrSilence.Silence -> {
+          val key = SilenceCacheKey(item.durationMs, audioConfig.sampleRate, audioConfig.channelCount)
+          silenceCounts.getOrPut(key) { mutableListOf() }.add(index)
+        }
+      }
+    }
+
+    val duplicateFiles = fileCounts.filter { it.value.size > 1 }.keys.toSet()
+    val duplicateSilence = silenceCounts.filter { it.value.size > 1 }.keys.toSet()
+
+    // Detect interleaved patterns: file -> silence -> file -> silence -> file
+    val interleavedPatterns = mutableListOf<InterleavedPattern>()
+
+    var i = 0
+    while (i < parsedData.size - 2) {
+      if (parsedData[i] is AudioDataOrSilence.AudioFile &&
+          parsedData[i + 1] is AudioDataOrSilence.Silence &&
+          parsedData[i + 2] is AudioDataOrSilence.AudioFile) {
+
+        val file1 = (parsedData[i] as AudioDataOrSilence.AudioFile).filePath
+        val silence = parsedData[i + 1] as AudioDataOrSilence.Silence
+        val file2 = (parsedData[i + 2] as AudioDataOrSilence.AudioFile).filePath
+        val silenceKey = SilenceCacheKey(silence.durationMs, audioConfig.sampleRate, audioConfig.channelCount)
+
+        // Check if it's the same file with silence separator
+        if (file1 == file2) {
+          var count = 1
+          var currentIndex = i
+          val indices = mutableListOf(i)
+
+          // Count how many times this pattern repeats
+          while (currentIndex + 2 < parsedData.size &&
+                 parsedData[currentIndex + 2] is AudioDataOrSilence.AudioFile &&
+                 (parsedData[currentIndex + 2] as AudioDataOrSilence.AudioFile).filePath == file1) {
+
+            // Check if there's a silence in between
+            if (currentIndex + 3 < parsedData.size &&
+                parsedData[currentIndex + 3] is AudioDataOrSilence.Silence) {
+              val nextSilence = parsedData[currentIndex + 3] as AudioDataOrSilence.Silence
+              val nextSilenceKey = SilenceCacheKey(nextSilence.durationMs, audioConfig.sampleRate, audioConfig.channelCount)
+
+              if (nextSilenceKey == silenceKey) {
+                count++
+                currentIndex += 2
+                indices.add(currentIndex)
+              } else {
+                break
+              }
+            } else {
+              // Last file in the pattern (no silence after)
+              count++
+              indices.add(currentIndex + 2)
+              break
+            }
+          }
+
+          if (count >= 2) {
+            interleavedPatterns.add(InterleavedPattern(file1, silenceKey, indices, count))
+            Log.d("AudioConcat", "Detected interleaved pattern: '$file1' + ${silenceKey.durationMs}ms silence, repeats $count times")
+            i = currentIndex + 2 // Skip processed items
+            continue
+          }
+        }
+      }
+      i++
+    }
+
+    Log.d("AudioConcat", "Duplicate analysis: ${duplicateFiles.size} files, ${duplicateSilence.size} silence patterns, ${interleavedPatterns.size} interleaved patterns")
+    duplicateFiles.forEach { file ->
+      Log.d("AudioConcat", "  File '$file' appears ${fileCounts[file]?.size} times")
+    }
+    duplicateSilence.forEach { key ->
+      Log.d("AudioConcat", "  Silence ${key.durationMs}ms appears ${silenceCounts[key]?.size} times")
+    }
+
+    return DuplicateAnalysis(duplicateFiles, duplicateSilence, fileCounts, silenceCounts, interleavedPatterns)
   }
 
   private fun parseAudioData(data: ReadableArray): List<AudioDataOrSilence> {
@@ -466,6 +951,12 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
 
       Log.d("AudioConcat", "Audio config: ${audioConfig.sampleRate}Hz, ${audioConfig.channelCount}ch, ${audioConfig.bitRate}bps")
 
+      // Analyze duplicates to determine cache strategy
+      val duplicateAnalysis = analyzeDuplicates(parsedData, audioConfig)
+
+      // Create cache instance with intelligent caching strategy
+      val cache = PCMCache(duplicateAnalysis.duplicateFiles, duplicateAnalysis.duplicateSilence)
+
       // Delete existing output file
       val outputFile = File(outputPath)
       if (outputFile.exists()) {
@@ -481,39 +972,192 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
       )
 
       try {
-        // Process each item
+        // Separate audio files and other items (silence)
+        val audioFileItems = mutableListOf<Pair<Int, String>>()
+        val nonAudioItems = mutableListOf<Pair<Int, AudioDataOrSilence>>()
+
         for ((index, item) in parsedData.withIndex()) {
           when (item) {
             is AudioDataOrSilence.AudioFile -> {
-              val filePath = item.filePath
-              Log.d("AudioConcat", "Item $index: Streaming decode $filePath")
+              audioFileItems.add(Pair(index, item.filePath))
+            }
+            is AudioDataOrSilence.Silence -> {
+              nonAudioItems.add(Pair(index, item))
+            }
+          }
+        }
 
-              val isLastFile = (index == parsedData.size - 1)
-              streamDecodeAudioFile(
-                filePath,
-                encoder,
-                isLastFile,
-                audioConfig.sampleRate,
-                audioConfig.channelCount
-              )
+        // Decide whether to use parallel or sequential processing
+        val useParallel = audioFileItems.size >= 10 // Use parallel for 10+ files
+
+        if (useParallel) {
+          Log.d("AudioConcat", "Using parallel processing for ${audioFileItems.size} audio files")
+
+          // Process interleaved patterns optimally
+          val processedIndices = mutableSetOf<Int>()
+
+          // First, handle all interleaved patterns
+          duplicateAnalysis.interleavedPatterns.forEach { pattern ->
+            Log.d("AudioConcat", "Processing interleaved pattern: ${pattern.filePath}, ${pattern.repeatCount} repetitions")
+
+            // Decode the file once
+            val filePath = pattern.filePath
+            val cachedData = cache.getAudioFile(filePath)
+
+            val pcmChunks = if (cachedData != null) {
+              Log.d("AudioConcat", "Using cached PCM for interleaved pattern: $filePath")
+              cachedData.chunks
+            } else {
+              // Decode once and store
+              val chunks = mutableListOf<ByteArray>()
+              val tempQueue = LinkedBlockingQueue<PCMChunk>(100)
+              val latch = CountDownLatch(1)
+              val seqStart = AtomicInteger(0)
+
+              parallelDecodeToQueue(filePath, tempQueue, seqStart, audioConfig.sampleRate, audioConfig.channelCount, latch, cache)
+
+              // Collect chunks
+              var collecting = true
+              while (collecting) {
+                val chunk = tempQueue.poll(100, java.util.concurrent.TimeUnit.MILLISECONDS)
+                if (chunk != null) {
+                  if (!chunk.isEndOfStream) {
+                    chunks.add(chunk.data)
+                  } else {
+                    collecting = false
+                  }
+                } else if (latch.count == 0L) {
+                  collecting = false
+                }
+              }
+
+              latch.await()
+              chunks
             }
 
-            is AudioDataOrSilence.Silence -> {
-              val durationMs = item.durationMs
-              Log.d("AudioConcat", "Item $index: Streaming silence ${durationMs}ms")
+            // Get silence PCM
+            val silencePCM = pattern.silenceKey?.let { cache.getSilence(it) }
+              ?: pattern.silenceKey?.let {
+                val totalSamples = ((it.durationMs / 1000.0) * it.sampleRate).toInt()
+                val bytesPerSample = it.channelCount * 2
+                ByteArray(totalSamples * bytesPerSample)
+              }
 
-              streamEncodeSilence(
-                durationMs,
-                encoder,
-                audioConfig.sampleRate,
-                audioConfig.channelCount
-              )
+            // Encode the pattern: file -> silence -> file -> silence -> ...
+            repeat(pattern.repeatCount) { iteration ->
+              // Encode file
+              pcmChunks.forEach { chunk ->
+                encoder.encodePCMChunk(chunk, false)
+              }
+
+              // Encode silence (except after the last file)
+              if (iteration < pattern.repeatCount - 1 && silencePCM != null) {
+                encoder.encodePCMChunk(silencePCM, false)
+              }
+            }
+
+            // Mark these indices as processed
+            pattern.indices.forEach { idx ->
+              processedIndices.add(idx)
+              if (idx + 1 < parsedData.size && parsedData[idx + 1] is AudioDataOrSilence.Silence) {
+                processedIndices.add(idx + 1)
+              }
+            }
+          }
+
+          // Then process remaining items normally
+          var audioFileIdx = 0
+          for ((index, item) in parsedData.withIndex()) {
+            if (processedIndices.contains(index)) {
+              if (item is AudioDataOrSilence.AudioFile) audioFileIdx++
+              continue
+            }
+
+            when (item) {
+              is AudioDataOrSilence.AudioFile -> {
+                // Collect consecutive audio files for parallel processing
+                val consecutiveFiles = mutableListOf<Pair<Int, String>>()
+                var currentIdx = audioFileIdx
+
+                while (currentIdx < audioFileItems.size) {
+                  val (itemIdx, filePath) = audioFileItems[currentIdx]
+                  if (processedIndices.contains(itemIdx)) {
+                    currentIdx++
+                    continue
+                  }
+                  if (itemIdx != index + (currentIdx - audioFileIdx)) break
+                  consecutiveFiles.add(Pair(itemIdx, filePath))
+                  currentIdx++
+                }
+
+                if (consecutiveFiles.isNotEmpty()) {
+                  parallelProcessAudioFiles(
+                    consecutiveFiles,
+                    encoder,
+                    audioConfig.sampleRate,
+                    audioConfig.channelCount,
+                    cache,
+                    numThreads = 3
+                  )
+                  audioFileIdx = currentIdx
+                }
+              }
+
+              is AudioDataOrSilence.Silence -> {
+                val durationMs = item.durationMs
+                Log.d("AudioConcat", "Item $index: Streaming silence ${durationMs}ms")
+                streamEncodeSilence(
+                  durationMs,
+                  encoder,
+                  audioConfig.sampleRate,
+                  audioConfig.channelCount,
+                  cache
+                )
+              }
+            }
+          }
+        } else {
+          Log.d("AudioConcat", "Using sequential processing for ${audioFileItems.size} audio files")
+
+          // Process each item sequentially (original behavior)
+          for ((index, item) in parsedData.withIndex()) {
+            when (item) {
+              is AudioDataOrSilence.AudioFile -> {
+                val filePath = item.filePath
+                Log.d("AudioConcat", "Item $index: Streaming decode $filePath")
+
+                val isLastFile = (index == parsedData.size - 1)
+                streamDecodeAudioFile(
+                  filePath,
+                  encoder,
+                  isLastFile,
+                  audioConfig.sampleRate,
+                  audioConfig.channelCount
+                )
+              }
+
+              is AudioDataOrSilence.Silence -> {
+                val durationMs = item.durationMs
+                Log.d("AudioConcat", "Item $index: Streaming silence ${durationMs}ms")
+
+                streamEncodeSilence(
+                  durationMs,
+                  encoder,
+                  audioConfig.sampleRate,
+                  audioConfig.channelCount,
+                  cache
+                )
+              }
             }
           }
         }
 
         // Finish encoding
         encoder.finish()
+
+        // Log cache statistics
+        Log.d("AudioConcat", "Cache statistics: ${cache.getStats()}")
+
         Log.d("AudioConcat", "Successfully merged audio to $outputPath")
         promise.resolve(outputPath)
 
