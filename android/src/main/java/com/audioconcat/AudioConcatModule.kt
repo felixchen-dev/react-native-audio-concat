@@ -160,6 +160,87 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
     }
   }
 
+  // Helper class to manage MediaCodec decoder reuse
+  private class ReusableDecoder {
+    private var decoder: MediaCodec? = null
+    private var currentMimeType: String? = null
+    private var currentFormat: MediaFormat? = null
+
+    fun getOrCreateDecoder(mimeType: String, format: MediaFormat): MediaCodec {
+      // Check if we can reuse the existing decoder
+      if (decoder != null && currentMimeType == mimeType && formatsCompatible(currentFormat, format)) {
+        // Flush the decoder to reset its state
+        try {
+          decoder!!.flush()
+          Log.d("AudioConcat", "  Reused decoder for $mimeType")
+          return decoder!!
+        } catch (e: Exception) {
+          Log.w("AudioConcat", "Failed to flush decoder, recreating: ${e.message}")
+          release()
+        }
+      }
+
+      // Need to create a new decoder
+      release() // Release old one if exists
+
+      val newDecoder = MediaCodec.createDecoderByType(mimeType)
+      newDecoder.configure(format, null, null, 0)
+      newDecoder.start()
+
+      decoder = newDecoder
+      currentMimeType = mimeType
+      currentFormat = format
+
+      Log.d("AudioConcat", "  Created new decoder for $mimeType")
+      return newDecoder
+    }
+
+    private fun formatsCompatible(format1: MediaFormat?, format2: MediaFormat): Boolean {
+      if (format1 == null) return false
+
+      // Check key format properties
+      return try {
+        format1.getInteger(MediaFormat.KEY_SAMPLE_RATE) == format2.getInteger(MediaFormat.KEY_SAMPLE_RATE) &&
+        format1.getInteger(MediaFormat.KEY_CHANNEL_COUNT) == format2.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+      } catch (e: Exception) {
+        false
+      }
+    }
+
+    fun release() {
+      decoder?.let {
+        try {
+          it.stop()
+          it.release()
+        } catch (e: Exception) {
+          Log.w("AudioConcat", "Error releasing decoder: ${e.message}")
+        }
+      }
+      decoder = null
+      currentMimeType = null
+      currentFormat = null
+    }
+  }
+
+  // Thread-safe decoder pool for parallel processing
+  private class DecoderPool {
+    private val decoders = ConcurrentHashMap<Long, ReusableDecoder>()
+
+    fun getDecoderForCurrentThread(): ReusableDecoder {
+      val threadId = Thread.currentThread().id
+      return decoders.getOrPut(threadId) {
+        Log.d("AudioConcat", "  Created decoder for thread $threadId")
+        ReusableDecoder()
+      }
+    }
+
+    fun releaseAll() {
+      decoders.values.forEach { it.release() }
+      decoders.clear()
+      Log.d("AudioConcat", "Released all pooled decoders")
+    }
+  }
+
   private fun extractAudioConfig(filePath: String): AudioConfig {
     val extractor = MediaExtractor()
     try {
@@ -467,7 +548,8 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
     targetSampleRate: Int,
     targetChannelCount: Int,
     latch: CountDownLatch,
-    cache: PCMCache
+    cache: PCMCache,
+    decoderPool: DecoderPool? = null
   ) {
     try {
       // Check cache first
@@ -487,6 +569,7 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
       var decoder: MediaCodec? = null
       val decodedChunks = mutableListOf<ByteArray>()
       var totalBytes = 0L
+      val shouldReleaseDecoder = (decoderPool == null) // Only release if not using pool
 
       try {
         extractor.setDataSource(filePath)
@@ -521,9 +604,17 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
         extractor.selectTrack(audioTrackIndex)
 
         val mime = audioFormat.getString(MediaFormat.KEY_MIME)!!
-        decoder = MediaCodec.createDecoderByType(mime)
-        decoder.configure(audioFormat, null, null, 0)
-        decoder.start()
+
+        // Use decoder pool if available, otherwise create new decoder
+        decoder = if (decoderPool != null) {
+          val reusableDecoder = decoderPool.getDecoderForCurrentThread()
+          reusableDecoder.getOrCreateDecoder(mime, audioFormat)
+        } else {
+          val newDecoder = MediaCodec.createDecoderByType(mime)
+          newDecoder.configure(audioFormat, null, null, 0)
+          newDecoder.start()
+          newDecoder
+        }
 
         val bufferInfo = MediaCodec.BufferInfo()
         var isEOS = false
@@ -586,8 +677,11 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
         }
 
       } finally {
-        decoder?.stop()
-        decoder?.release()
+        // Only stop/release decoder if not using pool
+        if (shouldReleaseDecoder) {
+          decoder?.stop()
+          decoder?.release()
+        }
         extractor.release()
       }
     } catch (e: Exception) {
@@ -603,11 +697,13 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
     encoder: StreamingEncoder,
     isLastFile: Boolean,
     targetSampleRate: Int,
-    targetChannelCount: Int
+    targetChannelCount: Int,
+    reusableDecoder: ReusableDecoder? = null
   ) {
     val startTime = System.currentTimeMillis()
     val extractor = MediaExtractor()
     var decoder: MediaCodec? = null
+    val shouldReleaseDecoder = (reusableDecoder == null) // Only release if not reusing
 
     try {
       extractor.setDataSource(filePath)
@@ -642,9 +738,16 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
       extractor.selectTrack(audioTrackIndex)
 
       val mime = audioFormat.getString(MediaFormat.KEY_MIME)!!
-      decoder = MediaCodec.createDecoderByType(mime)
-      decoder.configure(audioFormat, null, null, 0)
-      decoder.start()
+
+      // Use reusable decoder if provided, otherwise create a new one
+      decoder = if (reusableDecoder != null) {
+        reusableDecoder.getOrCreateDecoder(mime, audioFormat)
+      } else {
+        val newDecoder = MediaCodec.createDecoderByType(mime)
+        newDecoder.configure(audioFormat, null, null, 0)
+        newDecoder.start()
+        newDecoder
+      }
 
       val bufferInfo = MediaCodec.BufferInfo()
       var isEOS = false
@@ -697,8 +800,11 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
       }
 
     } finally {
-      decoder?.stop()
-      decoder?.release()
+      // Only stop/release decoder if we created it locally (not reusing)
+      if (shouldReleaseDecoder) {
+        decoder?.stop()
+        decoder?.release()
+      }
       extractor.release()
       val elapsedTime = System.currentTimeMillis() - startTime
       Log.d("AudioConcat", "  Decoded file in ${elapsedTime}ms")
@@ -826,6 +932,10 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
     val latch = CountDownLatch(optimizedFiles.size)
     val sequenceCounter = AtomicInteger(0)
 
+    // Create decoder pool for reuse across threads
+    val decoderPool = DecoderPool()
+    Log.d("AudioConcat", "Created decoder pool for parallel processing ($numThreads threads)")
+
     try {
       // Submit decode tasks for unique files only
       optimizedFiles.forEachIndexed { optIndex, (index, filePath) ->
@@ -835,7 +945,7 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
             sequenceCounter.addAndGet(1000000)
 
             Log.d("AudioConcat", "Starting parallel decode [$index]: $filePath")
-            parallelDecodeToQueue(filePath, pcmQueue, fileSequenceStart, targetSampleRate, targetChannelCount, latch, cache)
+            parallelDecodeToQueue(filePath, pcmQueue, fileSequenceStart, targetSampleRate, targetChannelCount, latch, cache, decoderPool)
 
             // Mark end with duplicate count
             val repeatCount = consecutiveDuplicates[optIndex] ?: 1
@@ -893,6 +1003,7 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
       Log.d("AudioConcat", "All parallel decode tasks completed")
 
     } finally {
+      decoderPool.releaseAll()
       executor.shutdown()
     }
   }
@@ -1240,36 +1351,47 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
         } else {
           Log.d("AudioConcat", "→ Using sequential processing for ${audioFileItems.size} audio files")
 
-          // Process each item sequentially (original behavior)
-          for ((index, item) in parsedData.withIndex()) {
-            when (item) {
-              is AudioDataOrSilence.AudioFile -> {
-                val filePath = item.filePath
-                Log.d("AudioConcat", "Item $index: Streaming decode $filePath")
+          // Create a reusable decoder for sequential processing
+          val reusableDecoder = ReusableDecoder()
+          Log.d("AudioConcat", "Created reusable decoder for sequential processing")
 
-                val isLastFile = (index == parsedData.size - 1)
-                streamDecodeAudioFile(
-                  filePath,
-                  encoder,
-                  isLastFile,
-                  outputSampleRate,
-                  audioConfig.channelCount
-                )
-              }
+          try {
+            // Process each item sequentially (with decoder reuse)
+            for ((index, item) in parsedData.withIndex()) {
+              when (item) {
+                is AudioDataOrSilence.AudioFile -> {
+                  val filePath = item.filePath
+                  Log.d("AudioConcat", "Item $index: Streaming decode $filePath")
 
-              is AudioDataOrSilence.Silence -> {
-                val durationMs = item.durationMs
-                Log.d("AudioConcat", "Item $index: Streaming silence ${durationMs}ms")
+                  val isLastFile = (index == parsedData.size - 1)
+                  streamDecodeAudioFile(
+                    filePath,
+                    encoder,
+                    isLastFile,
+                    outputSampleRate,
+                    audioConfig.channelCount,
+                    reusableDecoder
+                  )
+                }
 
-                streamEncodeSilence(
-                  durationMs,
-                  encoder,
-                  outputSampleRate,
-                  audioConfig.channelCount,
-                  cache
-                )
+                is AudioDataOrSilence.Silence -> {
+                  val durationMs = item.durationMs
+                  Log.d("AudioConcat", "Item $index: Streaming silence ${durationMs}ms")
+
+                  streamEncodeSilence(
+                    durationMs,
+                    encoder,
+                    outputSampleRate,
+                    audioConfig.channelCount,
+                    cache
+                  )
+                }
               }
             }
+          } finally {
+            // Release the reusable decoder when done
+            reusableDecoder.release()
+            Log.d("AudioConcat", "Released reusable decoder")
           }
         }
 
