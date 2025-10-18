@@ -356,57 +356,47 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
       return input
     }
 
+    val startTime = System.currentTimeMillis()
     val inputSampleCount = input.size / (2 * channelCount) // 16-bit = 2 bytes per sample
     val outputSampleCount = (inputSampleCount.toLong() * outputSampleRate / inputSampleRate).toInt()
     val output = ByteArray(outputSampleCount * 2 * channelCount)
 
-    // Use fixed-point arithmetic (16.16 format) to avoid floating-point operations
-    // This provides 3-5x performance improvement
-    val step = ((inputSampleRate.toLong() shl 16) / outputSampleRate).toInt()
-    var srcPos = 0
+    // Helper function to read a sample with bounds checking
+    fun readSample(sampleIndex: Int, channel: Int): Int {
+      val clampedIndex = sampleIndex.coerceIn(0, inputSampleCount - 1)
+      val idx = (clampedIndex * channelCount + channel) * 2
+      val unsigned = (input[idx].toInt() and 0xFF) or (input[idx + 1].toInt() shl 8)
+      return if (unsigned > 32767) unsigned - 65536 else unsigned
+    }
+
+    // Use floating-point for better accuracy than fixed-point
+    val ratio = inputSampleRate.toDouble() / outputSampleRate.toDouble()
 
     for (i in 0 until outputSampleCount) {
-      val srcIndex = srcPos shr 16
-      val fraction = srcPos and 0xFFFF // Fractional part in 16-bit fixed-point
-
-      // Boundary check: ensure we don't go beyond input array
-      if (srcIndex >= inputSampleCount - 1) {
-        break
-      }
+      val srcPos = i * ratio
+      val srcIndex = srcPos.toInt()
+      val fraction = srcPos - srcIndex // Fractional part (0.0 to 1.0)
 
       for (ch in 0 until channelCount) {
-        // Get current and next sample indices
-        val idx1 = (srcIndex * channelCount + ch) * 2
-        val idx2 = ((srcIndex + 1) * channelCount + ch) * 2
+        // Linear interpolation with floating-point precision
+        val s1 = readSample(srcIndex, ch).toDouble()
+        val s2 = readSample(srcIndex + 1, ch).toDouble()
 
-        // Read 16-bit samples (little-endian)
-        val sample1 = (input[idx1].toInt() and 0xFF) or (input[idx1 + 1].toInt() shl 8)
-        val sample2 = if (idx2 + 1 < input.size) {
-          (input[idx2].toInt() and 0xFF) or (input[idx2 + 1].toInt() shl 8)
-        } else {
-          sample1
-        }
-
-        // Convert to signed 16-bit
-        val s1 = if (sample1 > 32767) sample1 - 65536 else sample1
-        val s2 = if (sample2 > 32767) sample2 - 65536 else sample2
-
-        // Linear interpolation using integer arithmetic
-        // interpolated = s1 + (s2 - s1) * fraction
-        // fraction is in 16.16 format, so we shift right by 16 after multiplication
-        val interpolated = s1 + (((s2 - s1) * fraction) shr 16)
+        // Linear interpolation: s1 + (s2 - s1) * fraction
+        val interpolated = s1 + (s2 - s1) * fraction
 
         // Clamp to 16-bit range
-        val clamped = interpolated.coerceIn(-32768, 32767)
+        val clamped = interpolated.toInt().coerceIn(-32768, 32767)
 
-        // Convert back to unsigned and write (little-endian)
+        // Write to output (little-endian)
         val outIdx = (i * channelCount + ch) * 2
         output[outIdx] = (clamped and 0xFF).toByte()
         output[outIdx + 1] = (clamped shr 8).toByte()
       }
-
-      srcPos += step
     }
+
+    val elapsedTime = System.currentTimeMillis() - startTime
+    Log.d("AudioConcat", "  Resampled ${inputSampleRate}Hz→${outputSampleRate}Hz, ${input.size / 1024}KB→${output.size / 1024}KB in ${elapsedTime}ms")
 
     return output
   }
@@ -615,6 +605,7 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
     targetSampleRate: Int,
     targetChannelCount: Int
   ) {
+    val startTime = System.currentTimeMillis()
     val extractor = MediaExtractor()
     var decoder: MediaCodec? = null
 
@@ -709,6 +700,8 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
       decoder?.stop()
       decoder?.release()
       extractor.release()
+      val elapsedTime = System.currentTimeMillis() - startTime
+      Log.d("AudioConcat", "  Decoded file in ${elapsedTime}ms")
     }
   }
 
@@ -1032,17 +1025,24 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
   }
 
   override fun concatAudioFiles(data: ReadableArray, outputPath: String, promise: Promise) {
+    val totalStartTime = System.currentTimeMillis()
+    Log.d("AudioConcat", "========== Audio Concat Started ==========")
+
     try {
       if (data.size() == 0) {
         promise.reject("EMPTY_DATA", "Data array is empty")
         return
       }
 
+      // Parse data
+      val parseStartTime = System.currentTimeMillis()
       val parsedData = parseAudioData(data)
-      Log.d("AudioConcat", "Streaming merge of ${parsedData.size} items")
+      val parseTime = System.currentTimeMillis() - parseStartTime
+      Log.d("AudioConcat", "✓ Parsed ${parsedData.size} items in ${parseTime}ms")
       Log.d("AudioConcat", "Output: $outputPath")
 
       // Get audio config from first audio file
+      val configStartTime = System.currentTimeMillis()
       var audioConfig: AudioConfig? = null
       for (item in parsedData) {
         if (item is AudioDataOrSilence.AudioFile) {
@@ -1056,10 +1056,21 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
         return
       }
 
-      Log.d("AudioConcat", "Audio config: ${audioConfig.sampleRate}Hz, ${audioConfig.channelCount}ch, ${audioConfig.bitRate}bps")
+      val configTime = System.currentTimeMillis() - configStartTime
+
+      // Force output sample rate to 24kHz for optimal performance
+      val outputSampleRate = 24000
+      Log.d("AudioConcat", "✓ Extracted audio config in ${configTime}ms: ${audioConfig.channelCount}ch, ${audioConfig.bitRate}bps")
+      Log.d("AudioConcat", "Output sample rate: ${outputSampleRate}Hz (24kHz optimized)")
+
+      // Create modified config with fixed sample rate
+      val outputAudioConfig = AudioConfig(outputSampleRate, audioConfig.channelCount, audioConfig.bitRate)
 
       // Analyze duplicates to determine cache strategy
-      val duplicateAnalysis = analyzeDuplicates(parsedData, audioConfig)
+      val analysisStartTime = System.currentTimeMillis()
+      val duplicateAnalysis = analyzeDuplicates(parsedData, outputAudioConfig)
+      val analysisTime = System.currentTimeMillis() - analysisStartTime
+      Log.d("AudioConcat", "✓ Analyzed duplicates in ${analysisTime}ms")
 
       // Create cache instance with intelligent caching strategy
       val cache = PCMCache(duplicateAnalysis.duplicateFiles, duplicateAnalysis.duplicateSilence)
@@ -1070,9 +1081,9 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
         outputFile.delete()
       }
 
-      // Create streaming encoder
+      // Create streaming encoder with fixed 24kHz sample rate
       val encoder = StreamingEncoder(
-        audioConfig.sampleRate,
+        outputSampleRate,
         audioConfig.channelCount,
         audioConfig.bitRate,
         outputPath
@@ -1096,9 +1107,10 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
 
         // Decide whether to use parallel or sequential processing
         val useParallel = audioFileItems.size >= 10 // Use parallel for 10+ files
+        val processingStartTime = System.currentTimeMillis()
 
         if (useParallel) {
-          Log.d("AudioConcat", "Using parallel processing for ${audioFileItems.size} audio files")
+          Log.d("AudioConcat", "→ Using parallel processing for ${audioFileItems.size} audio files")
 
           // Process interleaved patterns optimally
           val processedIndices = mutableSetOf<Int>()
@@ -1121,7 +1133,7 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
               val latch = CountDownLatch(1)
               val seqStart = AtomicInteger(0)
 
-              parallelDecodeToQueue(filePath, tempQueue, seqStart, audioConfig.sampleRate, audioConfig.channelCount, latch, cache)
+              parallelDecodeToQueue(filePath, tempQueue, seqStart, outputSampleRate, audioConfig.channelCount, latch, cache)
 
               // Collect chunks
               var collecting = true
@@ -1203,7 +1215,7 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
                   parallelProcessAudioFiles(
                     consecutiveFiles,
                     encoder,
-                    audioConfig.sampleRate,
+                    outputSampleRate,
                     audioConfig.channelCount,
                     cache,
                     numThreads = optimalThreads
@@ -1218,7 +1230,7 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
                 streamEncodeSilence(
                   durationMs,
                   encoder,
-                  audioConfig.sampleRate,
+                  outputSampleRate,
                   audioConfig.channelCount,
                   cache
                 )
@@ -1226,7 +1238,7 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
             }
           }
         } else {
-          Log.d("AudioConcat", "Using sequential processing for ${audioFileItems.size} audio files")
+          Log.d("AudioConcat", "→ Using sequential processing for ${audioFileItems.size} audio files")
 
           // Process each item sequentially (original behavior)
           for ((index, item) in parsedData.withIndex()) {
@@ -1240,7 +1252,7 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
                   filePath,
                   encoder,
                   isLastFile,
-                  audioConfig.sampleRate,
+                  outputSampleRate,
                   audioConfig.channelCount
                 )
               }
@@ -1252,7 +1264,7 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
                 streamEncodeSilence(
                   durationMs,
                   encoder,
-                  audioConfig.sampleRate,
+                  outputSampleRate,
                   audioConfig.channelCount,
                   cache
                 )
@@ -1261,12 +1273,20 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
           }
         }
 
+        val processingTime = System.currentTimeMillis() - processingStartTime
+        Log.d("AudioConcat", "✓ Processing completed in ${processingTime}ms")
+
         // Finish encoding
+        val encodingFinishStartTime = System.currentTimeMillis()
         encoder.finish()
+        val encodingFinishTime = System.currentTimeMillis() - encodingFinishStartTime
+        Log.d("AudioConcat", "✓ Encoding finalized in ${encodingFinishTime}ms")
 
         // Log cache statistics
         Log.d("AudioConcat", "Cache statistics: ${cache.getStats()}")
 
+        val totalTime = System.currentTimeMillis() - totalStartTime
+        Log.d("AudioConcat", "========== Total Time: ${totalTime}ms (${totalTime / 1000.0}s) ==========")
         Log.d("AudioConcat", "Successfully merged audio to $outputPath")
         promise.resolve(outputPath)
 
