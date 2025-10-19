@@ -7,6 +7,7 @@ import {
   Alert,
   ScrollView,
 } from 'react-native';
+import PQueue from 'p-queue';
 import { concatAudioFiles } from 'react-native-audio-concat';
 import RNFS from 'react-native-fs';
 
@@ -21,54 +22,83 @@ export default function App() {
 
       // Both iOS and Android now support various audio formats (MP3, M4A, etc.)
       // Android will decode and re-encode to M4A (AAC)
-      // const audioExt = Platform.OS === 'ios' ? 'm4a' : 'mp3';
-      // const audio1 = `${RNFS.DocumentDirectoryPath}/audio1.${audioExt}`;
-      // const audio2 = `${RNFS.DocumentDirectoryPath}/audio2.${audioExt}`;
-      // const audio3 = `${RNFS.DocumentDirectoryPath}/audio3.${audioExt}`;
+
       const audio1 = `${RNFS.DocumentDirectoryPath}/speech-9ceec8fe480cd3df472a54156d628420.mp3`;
       const audio2 = `${RNFS.DocumentDirectoryPath}/speech-2526be023850e17acbde274337f6c8c1.mp3`;
       const audio3 = `${RNFS.DocumentDirectoryPath}/speech-0948f9b8d34ebe854ae4c3e0d04c22a3.mp3`;
       const audio4 = `${RNFS.DocumentDirectoryPath}/speech-8ba2ae99503b01b28345ed04dcf5e0c9.mp3`;
 
-      // Check if files exist
-      // const file1Exists = await RNFS.exists(audio1);
-      // const file2Exists = await RNFS.exists(audio2);
-      // const file3Exists = await RNFS.exists(audio3);
-
-      // if (!file1Exists || !file2Exists || !file3Exists) {
-      //   Alert.alert(
-      //     'Files Not Found',
-      //     `Please place test audio files at:\n${RNFS.DocumentDirectoryPath}/\n\nRequired files (${Platform.OS}):\n- audio1.${audioExt}\n- audio2.${audioExt}\n- audio3.${audioExt}`
-      //   );
-      //   setMergeStatus('Error: Audio files not found');
-      //   return;
-      // }
-
       // Output is always M4A (AAC) on both platforms
-      const outputFile = `${RNFS.DocumentDirectoryPath}/merged_output.m4a`;
+      // const outputFile = `${RNFS.DocumentDirectoryPath}/merged_output.m4a`;
+      // const outputFile2 = `${RNFS.DocumentDirectoryPath}/merged_output2.m4a`;
 
-      // Merge audio files with silence between them
-      // Using the new data structure: audio file, silence, audio file, silence, audio file
-      const result = await concatAudioFiles(
-        [
-          { filePath: audio1 },
-          { durationMs: 1500 },
-          { filePath: audio1 },
-          { durationMs: 1500 },
-          { filePath: audio1 },
-          { durationMs: 1500 },
-          { filePath: audio2 },
-          { durationMs: 1500 }, // 1.5 seconds silence
-          { filePath: audio3 },
-          { durationMs: 1500 },
-          { filePath: audio4 },
-        ],
-        outputFile
+      const spec = [
+        { filePath: audio1 },
+        { durationMs: 1500 },
+        { filePath: audio1 },
+        { durationMs: 1500 },
+        { filePath: audio1 },
+        { durationMs: 1500 },
+        { filePath: audio2 },
+        { durationMs: 1500 }, // 1.5 seconds silence
+        { filePath: audio3 },
+        { durationMs: 1500 },
+        { filePath: audio4 },
+      ];
+
+      const testArr = new Array(30).fill(spec);
+
+      const queue = new PQueue({ concurrency: 5 });
+
+      await queue.addAll(
+        testArr.map((item, index) => async () => {
+          const outFile = `${RNFS.DocumentDirectoryPath}/merged_output_${index}.m4a`;
+          await concatAudioFiles(item, outFile);
+          console.log(`Merged file ${index} to:`, outFile);
+        })
       );
 
-      setOutputPath(result);
+      // // Merge audio files with silence between them
+      // // Using the new data structure: audio file, silence, audio file, silence, audio file
+      // const [result, result2] = await Promise.all([
+      //   concatAudioFiles(
+      //     [
+      //       { filePath: audio1 },
+      //       { durationMs: 1500 },
+      //       { filePath: audio1 },
+      //       { durationMs: 1500 },
+      //       { filePath: audio1 },
+      //       { durationMs: 1500 },
+      //       { filePath: audio2 },
+      //       { durationMs: 1500 }, // 1.5 seconds silence
+      //       { filePath: audio3 },
+      //       { durationMs: 1500 },
+      //       { filePath: audio4 },
+      //     ],
+      //     outputFile
+      //   ),
+      //   concatAudioFiles(
+      //     [
+      //       { filePath: audio1 },
+      //       { durationMs: 1500 },
+      //       { filePath: audio1 },
+      //       { durationMs: 1500 },
+      //       { filePath: audio1 },
+      //       { durationMs: 1500 },
+      //       { filePath: audio2 },
+      //       { durationMs: 1500 }, // 1.5 seconds silence
+      //       { filePath: audio3 },
+      //       { durationMs: 1500 },
+      //       { filePath: audio4 },
+      //     ],
+      //     outputFile2
+      //   ),
+      // ]);
+
+      console.log('Merge result paths:');
+      setOutputPath('result');
       setMergeStatus('✅ Audio files merged successfully!');
-      Alert.alert('Success', `Audio merged to:\n${result}`);
+      Alert.alert('Success', `Audio merged `);
     } catch (error) {
       console.error('Error merging audio:', error);
       setMergeStatus(
