@@ -25,6 +25,11 @@ import java.util.concurrent.ConcurrentHashMap
 class AudioConcatModule(reactContext: ReactApplicationContext) :
   NativeAudioConcatSpec(reactContext) {
 
+  // CONCURRENCY PROTECTION: Serial executor to handle concurrent calls safely
+  // This prevents MediaCodec resource conflicts and ensures operations don't interfere
+  private val serialExecutor = Executors.newSingleThreadExecutor()
+  private val activeOperations = AtomicInteger(0)
+
   private data class AudioConfig(
     val sampleRate: Int,
     val channelCount: Int,
@@ -1311,15 +1316,28 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
     return NAME
   }
 
-  override fun concatAudioFiles(data: ReadableArray, outputPath: String, promise: Promise) {
-    val totalStartTime = System.currentTimeMillis()
-    Log.d("AudioConcat", "========== Audio Concat Started ==========")
+  override fun onCatalystInstanceDestroy() {
+    super.onCatalystInstanceDestroy()
+    // Clean up executor when module is destroyed
+    serialExecutor.shutdown()
+    Log.d("AudioConcat", "AudioConcat module destroyed, executor shutdown")
+  }
 
-    try {
-      if (data.size() == 0) {
-        promise.reject("EMPTY_DATA", "Data array is empty")
-        return
-      }
+  override fun concatAudioFiles(data: ReadableArray, outputPath: String, promise: Promise) {
+    // CONCURRENCY PROTECTION: Queue all operations to run serially
+    // This prevents MediaCodec resource conflicts when multiple calls happen simultaneously
+    val operationId = activeOperations.incrementAndGet()
+    Log.d("AudioConcat", "========== Audio Concat Queued (Operation #$operationId) ==========")
+
+    serialExecutor.submit {
+      val totalStartTime = System.currentTimeMillis()
+      Log.d("AudioConcat", "========== Audio Concat Started (Operation #$operationId) ==========")
+
+      try {
+        if (data.size() == 0) {
+          promise.reject("EMPTY_DATA", "Data array is empty")
+          return@submit
+        }
 
       // Parse data
       val parseStartTime = System.currentTimeMillis()
@@ -1340,7 +1358,7 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
 
       if (audioConfig == null) {
         promise.reject("NO_AUDIO_FILES", "No audio files found in data array")
-        return
+        return@submit
       }
 
       val configTime = System.currentTimeMillis() - configStartTime
@@ -1825,14 +1843,17 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
         Log.d("AudioConcat", "Successfully merged audio to $outputPath")
         promise.resolve(outputPath)
 
-      } catch (e: Exception) {
-        Log.e("AudioConcat", "Error during streaming merge: ${e.message}", e)
-        promise.reject("MERGE_ERROR", e.message, e)
-      }
+        } catch (e: Exception) {
+          Log.e("AudioConcat", "Error during streaming merge: ${e.message}", e)
+          promise.reject("MERGE_ERROR", e.message, e)
+        }
 
-    } catch (e: Exception) {
-      Log.e("AudioConcat", "Error parsing data: ${e.message}", e)
-      promise.reject("PARSE_ERROR", e.message, e)
+      } catch (e: Exception) {
+        Log.e("AudioConcat", "Error parsing data: ${e.message}", e)
+        promise.reject("PARSE_ERROR", e.message, e)
+      } finally {
+        Log.d("AudioConcat", "========== Audio Concat Finished (Operation #$operationId) ==========")
+      }
     }
   }
 
