@@ -7,6 +7,7 @@ import com.facebook.react.bridge.ReadableMap
 import com.facebook.react.module.annotations.ReactModule
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
+import android.media.MediaCodecList
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMuxer
@@ -165,6 +166,59 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
     private var decoder: MediaCodec? = null
     private var currentMimeType: String? = null
     private var currentFormat: MediaFormat? = null
+    private var isHardwareDecoder: Boolean = false
+
+    /**
+     * Try to create a hardware decoder for better performance
+     * Hardware decoders are typically 2-10x faster than software decoders
+     */
+    private fun createHardwareDecoder(mimeType: String, format: MediaFormat): MediaCodec? {
+      try {
+        val codecList = MediaCodecList(MediaCodecList.REGULAR_CODECS)
+
+        for (codecInfo in codecList.codecInfos) {
+          // Skip encoders
+          if (codecInfo.isEncoder) continue
+
+          // Check if this codec supports our mime type
+          if (!codecInfo.supportedTypes.any { it.equals(mimeType, ignoreCase = true) }) {
+            continue
+          }
+
+          // Hardware decoder identification by vendor prefix
+          val isHardware = codecInfo.name.let { name ->
+            name.startsWith("OMX.qcom") ||      // Qualcomm (most common)
+            name.startsWith("OMX.MTK") ||       // MediaTek
+            name.startsWith("OMX.Exynos") ||    // Samsung Exynos
+            name.startsWith("OMX.SEC") ||       // Samsung
+            name.startsWith("OMX.hisi") ||      // Huawei HiSilicon
+            name.startsWith("c2.qti") ||        // Qualcomm C2
+            name.startsWith("c2.mtk") ||        // MediaTek C2
+            name.startsWith("c2.exynos") ||     // Samsung C2
+            (name.contains("hardware", ignoreCase = true) &&
+             !name.contains("google", ignoreCase = true))
+          }
+
+          if (isHardware) {
+            try {
+              val codec = MediaCodec.createByCodecName(codecInfo.name)
+              codec.configure(format, null, null, 0)
+              codec.start()
+
+              Log.d("AudioConcat", "  ✓ Created HARDWARE decoder: ${codecInfo.name}")
+              return codec
+            } catch (e: Exception) {
+              Log.w("AudioConcat", "  ✗ HW decoder ${codecInfo.name} failed: ${e.message}")
+              // Continue to try next hardware decoder
+            }
+          }
+        }
+      } catch (e: Exception) {
+        Log.w("AudioConcat", "  Hardware decoder search failed: ${e.message}")
+      }
+
+      return null
+    }
 
     fun getOrCreateDecoder(mimeType: String, format: MediaFormat): MediaCodec {
       // Check if we can reuse the existing decoder
@@ -172,7 +226,8 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
         // Flush the decoder to reset its state
         try {
           decoder!!.flush()
-          Log.d("AudioConcat", "  Reused decoder for $mimeType")
+          val type = if (isHardwareDecoder) "HW" else "SW"
+          Log.d("AudioConcat", "  ↻ Reused $type decoder for $mimeType")
           return decoder!!
         } catch (e: Exception) {
           Log.w("AudioConcat", "Failed to flush decoder, recreating: ${e.message}")
@@ -183,15 +238,23 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
       // Need to create a new decoder
       release() // Release old one if exists
 
-      val newDecoder = MediaCodec.createDecoderByType(mimeType)
-      newDecoder.configure(format, null, null, 0)
-      newDecoder.start()
+      // Try hardware decoder first (2-10x faster)
+      var newDecoder = createHardwareDecoder(mimeType, format)
+      isHardwareDecoder = (newDecoder != null)
+
+      // Fallback to software decoder
+      if (newDecoder == null) {
+        newDecoder = MediaCodec.createDecoderByType(mimeType)
+        newDecoder.configure(format, null, null, 0)
+        newDecoder.start()
+        Log.d("AudioConcat", "  ⚠ Created SOFTWARE decoder for $mimeType (no HW available)")
+        isHardwareDecoder = false
+      }
 
       decoder = newDecoder
       currentMimeType = mimeType
       currentFormat = format
 
-      Log.d("AudioConcat", "  Created new decoder for $mimeType")
       return newDecoder
     }
 
@@ -281,6 +344,10 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
     private val channelCount: Int
     private val maxChunkSize: Int
 
+    // Performance tracking
+    private var totalBufferWaitTimeMs = 0L
+    private var bufferWaitCount = 0
+
     init {
       this.sampleRate = sampleRate
       this.channelCount = channelCount
@@ -323,8 +390,16 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
         val isLastChunk = (offset + chunkSize >= pcmData.size) && isLast
 
         // Feed PCM data chunk to encoder (reduced timeout for better throughput)
+        val bufferWaitStart = System.currentTimeMillis()
         val inputBufferIndex = encoder.dequeueInputBuffer(1000)
+        val bufferWaitTime = System.currentTimeMillis() - bufferWaitStart
+
         if (inputBufferIndex >= 0) {
+          if (bufferWaitTime > 5) {
+            totalBufferWaitTimeMs += bufferWaitTime
+            bufferWaitCount++
+          }
+
           val inputBuffer = encoder.getInputBuffer(inputBufferIndex)!!
           val bufferCapacity = inputBuffer.capacity()
 
@@ -342,6 +417,8 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
 
           offset += actualChunkSize
         } else {
+          totalBufferWaitTimeMs += bufferWaitTime
+          bufferWaitCount++
           // Buffer not available, drain first
           drainEncoder(false)
         }
@@ -407,6 +484,14 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
       }
     }
 
+    fun getEncoderStats(): String {
+      val avgWaitTime = if (bufferWaitCount > 0) {
+        String.format("%.2f", totalBufferWaitTimeMs.toFloat() / bufferWaitCount)
+      } else "0.00"
+
+      return "Buffer waits: $bufferWaitCount, Total wait: ${totalBufferWaitTimeMs}ms, Avg: ${avgWaitTime}ms"
+    }
+
     fun finish() {
       // Signal end of stream (reduced timeout)
       val inputBufferIndex = encoder.dequeueInputBuffer(1000)
@@ -416,6 +501,9 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
 
       // Drain remaining data
       drainEncoder(true)
+
+      // Log encoder performance stats
+      Log.d("AudioConcat", "Encoder stats: ${getEncoderStats()}")
 
       encoder.stop()
       encoder.release()
@@ -806,8 +894,16 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
         decoder?.release()
       }
       extractor.release()
+
+      // Performance metrics
       val elapsedTime = System.currentTimeMillis() - startTime
-      Log.d("AudioConcat", "  Decoded file in ${elapsedTime}ms")
+      val fileSize = try { File(filePath).length() } catch (e: Exception) { 0L }
+      val fileSizeKB = fileSize / 1024
+      val decodingSpeedMBps = if (elapsedTime > 0) {
+        (fileSize / 1024.0 / 1024.0) / (elapsedTime / 1000.0)
+      } else 0.0
+
+      Log.d("AudioConcat", "  ⚡ Decoded ${fileSizeKB}KB in ${elapsedTime}ms (${String.format("%.2f", decodingSpeedMBps)} MB/s)")
     }
   }
 
@@ -1183,8 +1279,17 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
       val analysisTime = System.currentTimeMillis() - analysisStartTime
       Log.d("AudioConcat", "✓ Analyzed duplicates in ${analysisTime}ms")
 
+      // Collect all unique audio files for pre-decode caching
+      val allAudioFiles = parsedData.filterIsInstance<AudioDataOrSilence.AudioFile>()
+        .map { it.filePath }
+        .distinct()
+
+      // Merge duplicate files with all unique files for comprehensive caching
+      // This ensures pre-decoded files are always cached, regardless of occurrence count
+      val filesToCache = (duplicateAnalysis.duplicateFiles + allAudioFiles).toSet()
+
       // Create cache instance with intelligent caching strategy
-      val cache = PCMCache(duplicateAnalysis.duplicateFiles, duplicateAnalysis.duplicateSilence)
+      val cache = PCMCache(filesToCache, duplicateAnalysis.duplicateSilence)
 
       // Delete existing output file
       val outputFile = File(outputPath)
@@ -1216,12 +1321,160 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
           }
         }
 
+        // PRE-DECODE: Parallel decode all unique audio files to cache before processing
+        val uniqueAudioFiles = audioFileItems.map { it.second }.distinct()
+        val filesToPreDecode = uniqueAudioFiles.filter { cache.getAudioFile(it) == null }
+
+        if (filesToPreDecode.isNotEmpty()) {
+          val preDecodeStartTime = System.currentTimeMillis()
+          val cpuCores = Runtime.getRuntime().availableProcessors()
+          val preDecodeThreads = getOptimalThreadCount(filesToPreDecode.size)
+
+          Log.d("AudioConcat", "→ PRE-DECODE: ${filesToPreDecode.size} unique files using $preDecodeThreads threads (CPU cores: $cpuCores)")
+
+          val preDecodeExecutor = Executors.newFixedThreadPool(preDecodeThreads)
+          val preDecodeLatch = CountDownLatch(filesToPreDecode.size)
+          val preDecodePool = DecoderPool()
+
+          try {
+            filesToPreDecode.forEach { filePath ->
+              preDecodeExecutor.submit {
+                try {
+                  Log.d("AudioConcat", "  Pre-decoding: $filePath")
+
+                  // Decode directly to cache without intermediate queue
+                  val extractor = MediaExtractor()
+                  var totalBytes = 0L
+                  val decodedChunks = mutableListOf<ByteArray>()
+
+                  try {
+                    extractor.setDataSource(filePath)
+
+                    var audioTrackIndex = -1
+                    var audioFormat: MediaFormat? = null
+
+                    for (i in 0 until extractor.trackCount) {
+                      val format = extractor.getTrackFormat(i)
+                      val mime = format.getString(MediaFormat.KEY_MIME) ?: continue
+                      if (mime.startsWith("audio/")) {
+                        audioTrackIndex = i
+                        audioFormat = format
+                        break
+                      }
+                    }
+
+                    if (audioTrackIndex == -1 || audioFormat == null) {
+                      throw Exception("No audio track found in $filePath")
+                    }
+
+                    val sourceSampleRate = audioFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+                    val sourceChannelCount = audioFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+
+                    val needsResampling = sourceSampleRate != outputSampleRate
+                    val needsChannelConversion = sourceChannelCount != audioConfig.channelCount
+
+                    if (needsResampling || needsChannelConversion) {
+                      Log.d("AudioConcat", "  Parallel decode: $filePath - ${sourceSampleRate}Hz ${sourceChannelCount}ch -> ${outputSampleRate}Hz ${audioConfig.channelCount}ch")
+                    }
+
+                    extractor.selectTrack(audioTrackIndex)
+
+                    val mime = audioFormat.getString(MediaFormat.KEY_MIME)!!
+                    val reusableDecoder = preDecodePool.getDecoderForCurrentThread()
+                    val decoder = reusableDecoder.getOrCreateDecoder(mime, audioFormat)
+
+                    val bufferInfo = MediaCodec.BufferInfo()
+                    var isEOS = false
+
+                    while (!isEOS) {
+                      // Feed input
+                      val inputBufferIndex = decoder.dequeueInputBuffer(1000)
+                      if (inputBufferIndex >= 0) {
+                        val inputBuffer = decoder.getInputBuffer(inputBufferIndex)!!
+                        val sampleSize = extractor.readSampleData(inputBuffer, 0)
+
+                        if (sampleSize < 0) {
+                          decoder.queueInputBuffer(inputBufferIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                        } else {
+                          val presentationTimeUs = extractor.sampleTime
+                          decoder.queueInputBuffer(inputBufferIndex, 0, sampleSize, presentationTimeUs, 0)
+                          extractor.advance()
+                        }
+                      }
+
+                      // Get output
+                      val outputBufferIndex = decoder.dequeueOutputBuffer(bufferInfo, 1000)
+                      if (outputBufferIndex >= 0) {
+                        val outputBuffer = decoder.getOutputBuffer(outputBufferIndex)!!
+
+                        if (bufferInfo.size > 0) {
+                          var pcmData = ByteArray(bufferInfo.size)
+                          outputBuffer.get(pcmData)
+
+                          // Convert channel count if needed
+                          if (needsChannelConversion) {
+                            pcmData = convertChannelCount(pcmData, sourceChannelCount, audioConfig.channelCount)
+                          }
+
+                          // Resample if needed
+                          if (needsResampling) {
+                            pcmData = resamplePCM16(pcmData, sourceSampleRate, outputSampleRate, audioConfig.channelCount)
+                          }
+
+                          decodedChunks.add(pcmData)
+                          totalBytes += pcmData.size
+                        }
+
+                        decoder.releaseOutputBuffer(outputBufferIndex, false)
+
+                        if ((bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
+                          isEOS = true
+                        }
+                      }
+                    }
+
+                    // Cache the decoded data
+                    if (decodedChunks.isNotEmpty()) {
+                      cache.putAudioFile(filePath, CachedPCMData(decodedChunks, totalBytes))
+                    }
+
+                  } finally {
+                    extractor.release()
+                  }
+
+                } catch (e: Exception) {
+                  Log.e("AudioConcat", "Error pre-decoding $filePath: ${e.message}", e)
+                } finally {
+                  preDecodeLatch.countDown()
+                }
+              }
+            }
+
+            // Wait for all pre-decoding to complete
+            preDecodeLatch.await()
+            preDecodePool.releaseAll()
+            preDecodeExecutor.shutdown()
+
+            val preDecodeTime = System.currentTimeMillis() - preDecodeStartTime
+            Log.d("AudioConcat", "✓ Pre-decode completed in ${preDecodeTime}ms")
+
+          } catch (e: Exception) {
+            Log.e("AudioConcat", "Error during pre-decode: ${e.message}", e)
+            preDecodePool.releaseAll()
+            preDecodeExecutor.shutdown()
+          }
+        } else {
+          Log.d("AudioConcat", "→ All audio files already cached, skipping pre-decode")
+        }
+
         // Decide whether to use parallel or sequential processing
-        val useParallel = audioFileItems.size >= 10 // Use parallel for 10+ files
+        // Parallel processing is beneficial even with few files due to multi-core CPUs
+        val useParallel = audioFileItems.size >= 3 // Use parallel for 3+ files (was 10)
         val processingStartTime = System.currentTimeMillis()
 
         if (useParallel) {
-          Log.d("AudioConcat", "→ Using parallel processing for ${audioFileItems.size} audio files")
+          val cpuCores = Runtime.getRuntime().availableProcessors()
+          Log.d("AudioConcat", "→ Using PARALLEL processing for ${audioFileItems.size} audio files (CPU cores: $cpuCores)")
 
           // Process interleaved patterns optimally
           val processedIndices = mutableSetOf<Int>()
@@ -1274,10 +1527,32 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
               }
 
             // Encode the pattern: file -> silence -> file -> silence -> ...
-            repeat(pattern.repeatCount) { iteration ->
-              // Encode file
+            // OPTIMIZATION: Batch chunks to reduce encoder call overhead
+            val patternStartTime = System.currentTimeMillis()
+
+            // Combine all chunks from the file into a single buffer
+            val combinedFileBuffer = if (pcmChunks.size > 10) {
+              val totalSize = pcmChunks.sumOf { it.size }
+              val buffer = ByteArray(totalSize)
+              var offset = 0
               pcmChunks.forEach { chunk ->
-                encoder.encodePCMChunk(chunk, false)
+                System.arraycopy(chunk, 0, buffer, offset, chunk.size)
+                offset += chunk.size
+              }
+              Log.d("AudioConcat", "  Batched ${pcmChunks.size} chunks into single buffer (${totalSize / 1024}KB)")
+              buffer
+            } else {
+              null
+            }
+
+            repeat(pattern.repeatCount) { iteration ->
+              // Encode file (batched or individual chunks)
+              if (combinedFileBuffer != null) {
+                encoder.encodePCMChunk(combinedFileBuffer, false)
+              } else {
+                pcmChunks.forEach { chunk ->
+                  encoder.encodePCMChunk(chunk, false)
+                }
               }
 
               // Encode silence (except after the last file)
@@ -1285,6 +1560,9 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
                 encoder.encodePCMChunk(silencePCM, false)
               }
             }
+
+            val patternTime = System.currentTimeMillis() - patternStartTime
+            Log.d("AudioConcat", "  Encoded interleaved pattern in ${patternTime}ms")
 
             // Mark these indices as processed
             pattern.indices.forEach { idx ->
@@ -1321,16 +1599,71 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
                 }
 
                 if (consecutiveFiles.isNotEmpty()) {
-                  val optimalThreads = getOptimalThreadCount(consecutiveFiles.size)
-                  Log.d("AudioConcat", "Using $optimalThreads threads for ${consecutiveFiles.size} files (CPU cores: ${Runtime.getRuntime().availableProcessors()})")
-                  parallelProcessAudioFiles(
-                    consecutiveFiles,
-                    encoder,
-                    outputSampleRate,
-                    audioConfig.channelCount,
-                    cache,
-                    numThreads = optimalThreads
-                  )
+                  // OPTIMIZATION: Fast path for cached files - avoid thread pool overhead
+                  val allCached = consecutiveFiles.all { (_, filePath) -> cache.getAudioFile(filePath) != null }
+
+                  if (allCached) {
+                    // Direct encoding from cache without parallel processing overhead
+                    val startTime = System.currentTimeMillis()
+                    Log.d("AudioConcat", "Fast path: encoding ${consecutiveFiles.size} cached files directly")
+
+                    consecutiveFiles.forEach { (itemIdx, filePath) ->
+                      val cachedData = cache.getAudioFile(filePath)!!
+                      val chunkCount = cachedData.chunks.size
+
+                      Log.d("AudioConcat", "  File[$itemIdx]: ${cachedData.totalBytes / 1024}KB in $chunkCount chunks")
+
+                      val encodeStartTime = System.currentTimeMillis()
+
+                      // OPTIMIZATION: Batch all chunks into single buffer to reduce encoder call overhead
+                      // Instead of 300+ calls at ~2.5ms each, make 1 call
+                      if (chunkCount > 10) {
+                        // Many small chunks - combine into single buffer for massive speedup
+                        val batchStartTime = System.currentTimeMillis()
+                        val combinedBuffer = ByteArray(cachedData.totalBytes.toInt())
+                        var offset = 0
+
+                        cachedData.chunks.forEach { chunk ->
+                          System.arraycopy(chunk, 0, combinedBuffer, offset, chunk.size)
+                          offset += chunk.size
+                        }
+
+                        val batchTime = System.currentTimeMillis() - batchStartTime
+                        Log.d("AudioConcat", "    Batched $chunkCount chunks in ${batchTime}ms")
+
+                        // Single encoder call instead of 300+
+                        encoder.encodePCMChunk(combinedBuffer, false)
+                      } else {
+                        // Few chunks - encode directly (rare case)
+                        cachedData.chunks.forEach { chunk ->
+                          encoder.encodePCMChunk(chunk, false)
+                        }
+                      }
+
+                      val encodeTime = System.currentTimeMillis() - encodeStartTime
+                      val throughputMBps = if (encodeTime > 0) {
+                        (cachedData.totalBytes / 1024.0 / 1024.0) / (encodeTime / 1000.0)
+                      } else 0.0
+
+                      Log.d("AudioConcat", "    Encoded in ${encodeTime}ms (${String.format("%.2f", throughputMBps)} MB/s)")
+                    }
+
+                    val elapsedTime = System.currentTimeMillis() - startTime
+                    val totalKB = consecutiveFiles.sumOf { (_, filePath) -> cache.getAudioFile(filePath)!!.totalBytes } / 1024
+                    Log.d("AudioConcat", "  ⚡ Encoded ${consecutiveFiles.size} cached files (${totalKB}KB) in ${elapsedTime}ms")
+                  } else {
+                    // Standard parallel processing for non-cached files
+                    val optimalThreads = getOptimalThreadCount(consecutiveFiles.size)
+                    Log.d("AudioConcat", "Using $optimalThreads threads for ${consecutiveFiles.size} files (CPU cores: ${Runtime.getRuntime().availableProcessors()})")
+                    parallelProcessAudioFiles(
+                      consecutiveFiles,
+                      encoder,
+                      outputSampleRate,
+                      audioConfig.channelCount,
+                      cache,
+                      numThreads = optimalThreads
+                    )
+                  }
                   audioFileIdx = currentIdx
                 }
               }
