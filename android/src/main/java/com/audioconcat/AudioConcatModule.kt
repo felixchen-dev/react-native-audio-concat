@@ -365,8 +365,9 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
       val samplesPerFrame = 1024
       val bytesPerSample = channelCount * 2 // 16-bit PCM
       val optimalBufferSize = samplesPerFrame * bytesPerSample
-      // Use at least the optimal size, but allow for some overhead
-      val bufferSize = (optimalBufferSize * 1.5).toInt().coerceAtLeast(16384)
+      // OPTIMIZATION: Increased buffer size for better throughput
+      // Larger buffers reduce dequeue operations and improve encoder efficiency
+      val bufferSize = (optimalBufferSize * 4.0).toInt().coerceAtLeast(65536)
       outputFormat.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, bufferSize)
 
       // Store for use in encodePCMChunk
@@ -384,6 +385,7 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
     fun encodePCMChunk(pcmData: ByteArray, isLast: Boolean = false): Boolean {
       // Split large PCM data into smaller chunks that fit in encoder buffer (use configured size)
       var offset = 0
+      var buffersQueued = 0  // Track queued buffers for batch draining
 
       while (offset < pcmData.size) {
         val chunkSize = minOf(maxChunkSize, pcmData.size - offset)
@@ -416,16 +418,20 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
           encoder.queueInputBuffer(inputBufferIndex, 0, actualChunkSize, presentationTimeUs, flags)
 
           offset += actualChunkSize
+          buffersQueued++
         } else {
           totalBufferWaitTimeMs += bufferWaitTime
           bufferWaitCount++
           // Buffer not available, drain first
           drainEncoder(false)
+          buffersQueued = 0  // Reset counter after forced drain
         }
 
-        // Drain encoder output periodically
-        if (offset < pcmData.size || !isLastChunk) {
+        // OPTIMIZATION: Batch drain - only drain every 4 buffers instead of every buffer
+        // This reduces overhead while keeping encoder pipeline flowing
+        if (buffersQueued >= 4 || isLastChunk || offset >= pcmData.size) {
           drainEncoder(false)
+          buffersQueued = 0
         }
       }
 
@@ -584,33 +590,107 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
 
     when {
       inputChannels == 1 && outputChannels == 2 -> {
-        // Mono to Stereo: duplicate the channel
-        for (i in 0 until sampleCount) {
+        // OPTIMIZED: Mono to Stereo using batch copy with unrolled loop
+        // Process 4 samples at a time for better cache locality
+        val batchSize = 4
+        val fullBatches = sampleCount / batchSize
+        var i = 0
+
+        // Process batches of 4 samples
+        for (batch in 0 until fullBatches) {
+          val baseIdx = i * 2
+          val baseDst = i * 4
+
+          // Sample 1
+          output[baseDst] = input[baseIdx]
+          output[baseDst + 1] = input[baseIdx + 1]
+          output[baseDst + 2] = input[baseIdx]
+          output[baseDst + 3] = input[baseIdx + 1]
+
+          // Sample 2
+          output[baseDst + 4] = input[baseIdx + 2]
+          output[baseDst + 5] = input[baseIdx + 3]
+          output[baseDst + 6] = input[baseIdx + 2]
+          output[baseDst + 7] = input[baseIdx + 3]
+
+          // Sample 3
+          output[baseDst + 8] = input[baseIdx + 4]
+          output[baseDst + 9] = input[baseIdx + 5]
+          output[baseDst + 10] = input[baseIdx + 4]
+          output[baseDst + 11] = input[baseIdx + 5]
+
+          // Sample 4
+          output[baseDst + 12] = input[baseIdx + 6]
+          output[baseDst + 13] = input[baseIdx + 7]
+          output[baseDst + 14] = input[baseIdx + 6]
+          output[baseDst + 15] = input[baseIdx + 7]
+
+          i += batchSize
+        }
+
+        // Process remaining samples
+        while (i < sampleCount) {
           val srcIdx = i * 2
           val dstIdx = i * 4
           output[dstIdx] = input[srcIdx]
           output[dstIdx + 1] = input[srcIdx + 1]
           output[dstIdx + 2] = input[srcIdx]
           output[dstIdx + 3] = input[srcIdx + 1]
+          i++
         }
       }
       inputChannels == 2 && outputChannels == 1 -> {
-        // Stereo to Mono: average the channels
-        for (i in 0 until sampleCount) {
+        // OPTIMIZED: Stereo to Mono with unrolled loop
+        val batchSize = 4
+        val fullBatches = sampleCount / batchSize
+        var i = 0
+
+        // Process batches of 4 samples
+        for (batch in 0 until fullBatches) {
+          val baseSrc = i * 4
+          val baseDst = i * 2
+
+          // Sample 1
+          var left = (input[baseSrc].toInt() and 0xFF) or (input[baseSrc + 1].toInt() shl 8)
+          var right = (input[baseSrc + 2].toInt() and 0xFF) or (input[baseSrc + 3].toInt() shl 8)
+          var avg = (((if (left > 32767) left - 65536 else left) + (if (right > 32767) right - 65536 else right)) shr 1)
+          output[baseDst] = (avg and 0xFF).toByte()
+          output[baseDst + 1] = (avg shr 8).toByte()
+
+          // Sample 2
+          left = (input[baseSrc + 4].toInt() and 0xFF) or (input[baseSrc + 5].toInt() shl 8)
+          right = (input[baseSrc + 6].toInt() and 0xFF) or (input[baseSrc + 7].toInt() shl 8)
+          avg = (((if (left > 32767) left - 65536 else left) + (if (right > 32767) right - 65536 else right)) shr 1)
+          output[baseDst + 2] = (avg and 0xFF).toByte()
+          output[baseDst + 3] = (avg shr 8).toByte()
+
+          // Sample 3
+          left = (input[baseSrc + 8].toInt() and 0xFF) or (input[baseSrc + 9].toInt() shl 8)
+          right = (input[baseSrc + 10].toInt() and 0xFF) or (input[baseSrc + 11].toInt() shl 8)
+          avg = (((if (left > 32767) left - 65536 else left) + (if (right > 32767) right - 65536 else right)) shr 1)
+          output[baseDst + 4] = (avg and 0xFF).toByte()
+          output[baseDst + 5] = (avg shr 8).toByte()
+
+          // Sample 4
+          left = (input[baseSrc + 12].toInt() and 0xFF) or (input[baseSrc + 13].toInt() shl 8)
+          right = (input[baseSrc + 14].toInt() and 0xFF) or (input[baseSrc + 15].toInt() shl 8)
+          avg = (((if (left > 32767) left - 65536 else left) + (if (right > 32767) right - 65536 else right)) shr 1)
+          output[baseDst + 6] = (avg and 0xFF).toByte()
+          output[baseDst + 7] = (avg shr 8).toByte()
+
+          i += batchSize
+        }
+
+        // Process remaining samples
+        while (i < sampleCount) {
           val srcIdx = i * 4
           val dstIdx = i * 2
-
           val left = (input[srcIdx].toInt() and 0xFF) or (input[srcIdx + 1].toInt() shl 8)
           val right = (input[srcIdx + 2].toInt() and 0xFF) or (input[srcIdx + 3].toInt() shl 8)
-
-          val leftSigned = if (left > 32767) left - 65536 else left
-          val rightSigned = if (right > 32767) right - 65536 else right
-
-          // Use bit shift instead of division for better performance (x / 2 = x >> 1)
-          val avg = ((leftSigned + rightSigned) shr 1).coerceIn(-32768, 32767)
-
+          val avg = (((if (left > 32767) left - 65536 else left) + (if (right > 32767) right - 65536 else right)) shr 1)
           output[dstIdx] = (avg and 0xFF).toByte()
           output[dstIdx + 1] = (avg shr 8).toByte()
+          i++
         }
       }
       else -> {
