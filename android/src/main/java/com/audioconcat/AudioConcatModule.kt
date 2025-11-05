@@ -115,6 +115,49 @@ class AudioConcatModule(reactContext: ReactApplicationContext) :
     }
   }
 
+  override fun convertToM4a(inputPath: String, outputPath: String, promise: Promise) {
+    try {
+      // Check if input file exists
+      val inputFile = File(inputPath)
+      if (!inputFile.exists()) {
+        promise.reject("INPUT_NOT_FOUND", "Input file does not exist: $inputPath")
+        return
+      }
+
+      Log.d("AudioConcat", "Converting to M4A: $inputPath")
+      Log.d("AudioConcat", "Output: $outputPath")
+
+      // Delete existing output file
+      val outputFile = File(outputPath)
+      if (outputFile.exists()) {
+        outputFile.delete()
+      }
+
+      // Build FFmpeg command for M4A conversion with AAC codec
+      val command = "-y -i \"$inputPath\" -c:a aac -b:a 128k -f mp4 \"$outputPath\" -loglevel level+error"
+      Log.d("AudioConcat", "FFmpeg command: $command")
+
+      // Execute FFmpeg command
+      FFmpegKit.executeAsync(command) { session ->
+        val returnCode = session.returnCode
+        if (ReturnCode.isSuccess(returnCode)) {
+          Log.d("AudioConcat", "Successfully converted to M4A: $outputPath")
+          promise.resolve(outputPath)
+        } else {
+          val output = session.output
+          val error = session.failStackTrace
+          Log.e("AudioConcat", "FFmpeg failed: $output")
+          Log.e("AudioConcat", "Error: $error")
+          promise.reject("FFMPEG_ERROR", "FFmpeg conversion failed: $output", Exception(error))
+        }
+      }
+
+    } catch (e: Exception) {
+      Log.e("AudioConcat", "Error converting to M4A: ${e.message}", e)
+      promise.reject("CONVERSION_ERROR", e.message, e)
+    }
+  }
+
   companion object {
     const val NAME = "AudioConcat"
   }

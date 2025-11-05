@@ -7,6 +7,7 @@ export interface Spec extends TurboModule {
     data: AudioDataOrSilence[],
     outputPath: string
   ): Promise<string>;
+  convertToM4a(inputPath: string, outputPath: string): Promise<string>;
 }
 
 export default TurboModuleRegistry.getEnforcing<Spec>('AudioConcat');

@@ -8,3 +8,10 @@ export function concatAudioFiles(
 ): Promise<string> {
   return AudioConcat.concatAudioFiles(data, outputPath);
 }
+
+export function convertToM4a(
+  inputPath: string,
+  outputPath: string
+): Promise<string> {
+  return AudioConcat.convertToM4a(inputPath, outputPath);
+}

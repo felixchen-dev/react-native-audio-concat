@@ -5,6 +5,7 @@ Concatenate audio files and silence periods into a single audio file for React N
 ## Features
 
 - ✅ Concat multiple audio files with silence periods
+- ✅ Convert audio files to M4A format with AAC encoding
 - ✅ Support for iOS and Android
 - ✅ Output in M4A format
 
@@ -25,6 +26,8 @@ cd ios && pod install
 No additional steps required.
 
 ## Usage
+
+### Concatenate Audio Files
 
 ```typescript
 import { concatAudioFiles } from 'react-native-audio-concat';
@@ -48,6 +51,22 @@ try {
 }
 ```
 
+### Convert Audio to M4A
+
+```typescript
+import { convertToM4a } from 'react-native-audio-concat';
+
+const inputPath = '/path/to/audio.mp3';
+const outputPath = '/path/to/output.m4a';
+
+try {
+  const result = await convertToM4a(inputPath, outputPath);
+  console.log('Converted to M4A:', result);
+} catch (error) {
+  console.error('Conversion failed:', error);
+}
+```
+
 ## API
 
 ### `concatAudioFiles(data, outputPath)`
@@ -64,6 +83,24 @@ Concatenates audio files and silence periods into a single output file.
 **Returns:**
 
 - `Promise<string>` - Resolves with the output file path
+
+### `convertToM4a(inputPath, outputPath)`
+
+Converts an audio file to M4A format with AAC encoding.
+
+**Parameters:**
+
+- `inputPath`: `string` - Absolute path to the input audio file (supports MP3, WAV, FLAC, OGG, M4A, and other common formats)
+- `outputPath`: `string` - Absolute path where the M4A file will be saved
+
+**Returns:**
+
+- `Promise<string>` - Resolves with the output file path
+
+**Notes:**
+
+- On Android: Uses FFmpeg with AAC codec at 128kbps bitrate
+- On iOS: Uses AVFoundation's native M4A export preset
 
 ## Example
 
